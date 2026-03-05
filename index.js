@@ -87,6 +87,31 @@ function formatTanggalExcel(val) {
 }
 
 // --- FUNGSI PARSING DATA ---
+// --- FUNGSI PEMBANTU: PENYORTIR KATEGORI ALAT ---
+function tentukanKategori(namaAlat) {
+    const teks = namaAlat.toLowerCase();
+    
+    // Kategori VISUAL
+    if (teks.includes('videotron') || teks.includes('tv') || teks.includes('monitor') || teks.includes('projector') || teks.includes('screen')) {
+        return "📺 VISUAL";
+    }
+    // Kategori LIGHTING
+    else if (teks.includes('moving') || teks.includes('strobe') || teks.includes('fresnel') || teks.includes('par led') || teks.includes('avolite') || teks.includes('grandma') || teks.includes('lighting') || teks.includes('beam')) {
+        return "💡 LIGHTING";
+    }
+    // Kategori SOUND
+    else if (teks.includes('console') || teks.includes('speaker') || teks.includes('subwoofer') || teks.includes('mic') || teks.includes('yamaha') || teks.includes('midas') || teks.includes('dl32') || teks.includes('foh') || teks.includes('mixer')) {
+        return "🔊 SOUND";
+    }
+    // Kategori POWER
+    else if (teks.includes('genset') || teks.includes('kabel') || teks.includes('power') || teks.includes('panel')) {
+        return "⚡ POWER";
+    }
+    // Jika tidak masuk ke mana-mana
+    return "📦 LAINNYA"; 
+}
+
+// --- FUNGSI PARSING DATA (VERSI TEMPLATE PREMIUM) ---
 function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
     let daftarPesanWA = [];
     let blocks = [];
@@ -116,7 +141,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
             const eventTitle = getVal(2, c + 6);
             if (!eventTitle || eventTitle === "-" || eventTitle === "Event Tittle" || eventTitle === "") continue; 
 
-            const customerName = getVal(1, c + 1) || "-";
             const companyName  = getVal(2, c + 1) || "-";
             const dateEventRaw = block[1] ? block[1][c+6] : "-"; 
             const dateEvent    = formatTanggalExcel(dateEventRaw);
@@ -124,7 +148,15 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
             const loadingDate  = getVal(4, c + 6) || "-";
             
             let crewList = [];
-            let itemList = [];
+            
+            // Siapkan wadah untuk masing-masing kategori
+            let kategoriAlat = {
+                "📺 VISUAL": [],
+                "💡 LIGHTING": [],
+                "🔊 SOUND": [],
+                "⚡ POWER": [],
+                "📦 LAINNYA": []
+            };
             
             for (let i = 8; i < block.length; i++) {
                 const marker = getVal(i, c).toUpperCase();
@@ -139,31 +171,42 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
                 const freq = getVal(i, c + 5); 
 
                 if (qty && item && item.toUpperCase() !== "ITEM") {
-                    let teksAlat = `* ${qty} ${item} ${spec}`;
-                    if (freq && freq !== "-") teksAlat += ` (${freq})`; 
-                    itemList.push(teksAlat.replace(/\s+/g, ' ').trim());
+                    let namaLengkap = `${item} ${spec}`.trim();
+                    let teksAlat = `• ${qty} ${namaLengkap}`;
+                    
+                    if (freq && freq !== "-") teksAlat += ` (${freq})`; // Durasi jika ada
+                    
+                    teksAlat = teksAlat.replace(/\s+/g, ' ').trim();
+                    
+                    // Sortir otomatis masukkan ke kotak yang tepat
+                    let namaKategori = tentukanKategori(namaLengkap);
+                    kategoriAlat[namaKategori].push(teksAlat);
                 }
             }
 
-            let msg = `━━━━━ 📝 *DETAIL EVENT* ━━━━━\n\n`;
-            msg += `📌 *EVENT:* ${eventTitle}\n`;
-            msg += `🏢 *KLIEN:* ${companyName}\n`;
-            msg += `📍 *VENUE:* ${venue}\n`;
-            msg += `📅 *TANGGAL:* ${dateEvent}\n`;
-            msg += `🚚 *LOADING:* ${loadingDate}\n\n`;
-
-            msg += `👥 *TIM BERTUGAS (CREW):*\n`;
-            msg += crewList.length > 0 ? crewList.map(c => `   ◦ ${c}`).join('\n') : `   - (Belum ada kru)`;
+            // --- MULAI MENYUSUN PESAN SESUAI TEMPLATE ---
+            let msg = `━━━━━━━━━━━━━━━━━━━━\n📝 *EVENT DETAIL*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+            
+            msg += `📌 *EVENT* : ${eventTitle}\n`;
+            msg += `🏢 *CLIENT* : ${companyName}\n`;
+            msg += `📍 *VENUE* : ${venue}\n`;
+            msg += `📅 *DATE* : ${dateEvent}\n`;
+            msg += `🚚 *LOADING*: ${loadingDate}\n\n`;
+            
+            msg += `━━━━━━━━━━━━━━━━━━━━\n👥 *CREW*\n`;
+            msg += crewList.length > 0 ? crewList.map(cr => `• ${cr}`).join('\n') : `• (Belum ada crew)`;
             msg += `\n\n`;
 
-            msg += `📦 *DAFTAR ALAT & DURASI:*\n`;
-            if (itemList.length > 0) {
-                msg += itemList.join('\n');
-            } else {
-                msg += `   - (Data alat kosong)`;
+            // Loop untuk menampilkan kategori alat hanya jika ada isinya
+            for (const [namaKat, listKat] of Object.entries(kategoriAlat)) {
+                if (listKat.length > 0) {
+                    msg += `━━━━━━━━━━━━━━━━━━━━\n${namaKat}\n`;
+                    msg += listKat.join('\n') + `\n\n`;
+                }
             }
 
-            msg += `\n\n━━━━━━━━━━━━━━━━━━━━`;
+            msg = msg.trim() + `\n━━━━━━━━━━━━━━━━━━━━`;
+            
             daftarPesanWA.push(msg);
         }
     }
@@ -173,7 +216,7 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
 // --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-background-timer-throttling',] }
 });
 
 client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
@@ -207,6 +250,21 @@ const simulateTyping = async (chat, text) => {
     
     await new Promise(resolve => setTimeout(resolve, typingTime));
 };
+
+// --- SISTEM ANTI-ZOMBIE (AUTO RESTART) ---
+
+// 1. Jika WhatsApp memutus koneksi
+client.on('disconnected', (reason) => {
+    console.log('❌ Bot terputus dari WhatsApp! Alasan:', reason);
+    console.log('🔄 Mematikan proses agar direstart ulang oleh PM2...');
+    process.exit(1); // Ini akan memaksa Node.js mati, dan PM2 akan otomatis menghidupkannya lagi
+});
+
+// 2. Jika ada error tak terduga (agar script tidak nge-hang)
+process.on('unhandledRejection', (error) => {
+    console.error('⚠️ Ada error tak tertangkap:', error.message);
+    // Jangan di-exit di sini, cukup log saja agar bot tetap jalan
+});
 
 // --- WHATSAPP MESSAGE HANDLER ---
 client.on('message', async (msg) => {
