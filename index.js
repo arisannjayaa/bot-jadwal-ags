@@ -92,16 +92,19 @@ function formatTanggalExcel(val) {
 function tentukanKategori(namaAlat) {
     const teks = namaAlat.toLowerCase();
 
-  // 1. JALUR VIP (PENGECUALIAN KHUSUS)
-    // Gunakan ini untuk nama alat yang mengandung 2 unsur divisi berbeda
+  // 1. JALUR VIP (PENGECUALIAN KHUSUS ANTI-NYASAR)
     if (teks.includes('drum riser') || teks.includes('riser')) return "🏗️ RIGGING & STAGING";
     if (teks.includes('genset lighting')) return "⚡ POWER";
     if (teks.includes('panel visual') || teks.includes('panel audio')) return "⚡ POWER";
+    
+    // Pengecualian Baru:
+    if (teks.includes('video mixer') || teks.includes('black magic')) return "📺 VISUAL & MULTIMEDIA";
+    if (teks.includes('stage i/o') || teks.includes('analog snake')) return "🔊 SOUND & BACKLINE";
 
     // 2. KAMUS UTAMA
     const kamusKategori = {
         "⚡ POWER": [
-            'genset', 'kabel', 'power', 'panel', 'distro', 'genzet'
+            'genset', 'kabel', 'power', 'panel', 'distro'
         ],
         "🔊 SOUND & BACKLINE": [
             'console', 'speaker', 'subwoofer', 'mic', 'yamaha', 'midas', 
@@ -109,18 +112,21 @@ function tentukanKategori(namaAlat) {
             'iem', 'drumset', 'tama', 'sound system', 'milan', 'sp milan', 
             'pa ', 'senheiser', 'sennheiser', 'roland', 'akustika',
             'stage monitor', 'musician monitor', 'dbr', 'dxs', 'audio',
-            'pdp', 'dw', 'cymbal', 'paiste', 'amplifier', 'gallien', 'krueger', 'head'
+            'pdp', 'dw', 'cymbal', 'paiste', 'amplifier', 'gallien', 'krueger', 'head',
+            'snake' // Tambahan untuk snake cable
         ],
         "📺 VISUAL & MULTIMEDIA": [
             'videotron', 'tv', 'monitor', 'projector', 'screen', 'kamera', 'camera',
             'cam ', 'switcher', 'klicker', 'perfect cue', 'laptop', 'timer', 
             'sony', 'hollyland', 'streaming', 'vmix', 'internet', 'orbit', 'vj', 'visual',
-            'procesor', 'processor', 'magimage', 'led outdoor', 'led p' // 'led' murni dihapus agar tidak nabrak PAR LED
+            'procesor', 'processor', 'magimage', 'led outdoor', 'led p',
+            'black magic', 'blackmagic' // Tambahan untuk Blackmagic Design
         ],
         "💡 LIGHTING": [
             'moving', 'strobe', 'fresnel', 'par led', 'par light', 'nuovoled', 'avolite', 
             'grandma', 'grand ma', 'lighting', 'beam', 'smoke', 'hazer', 'efx', 'minuit', 
-            'tripod t', 'follow spot', 'folow spot', 'spot led', 'blinder', 'par zoom'
+            'tripod t', 'follow spot', 'folow spot', 'spot led', 'blinder', 'par zoom',
+            'atomic' // Tambahan untuk Strobe Atomic
         ],
         "🏗️ RIGGING & STAGING": [
             'rigging', 'rig', 'gawangan', 'level', 'aluminium', 'stage', 
@@ -316,7 +322,15 @@ client.on('message', async (msg) => {
     const chat = await msg.getChat();
 
     if (['halo', 'menu', 'jadwal', 'bot'].includes(text)) {
-        const balasanMenu = `🤖 *MENU JADWAL*\n\n1️⃣ Hari Ini\n2️⃣ Besok\n3️⃣ Semua Jadwal Bulan Ini`;
+        const balasanMenu = `━━━━━━━━━━━━━━━━━━
+            📅 *JADWAL EVENT*
+            ━━━━━━━━━━━━━━━━━━
+
+            1️⃣ 📍 Hari Ini
+            2️⃣ 📍 Besok
+            3️⃣ 📆 Bulan Ini
+
+            ✏️ Ketik nomor menu`;
         
         await simulateTyping(chat, balasanMenu);
         await msg.reply(balasanMenu);
