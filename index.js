@@ -8,7 +8,7 @@ const XLSX = require('xlsx');
 // --- KONFIGURASI ---
 const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
 // const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
-const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us'; 
+const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us';
 
 let memoriDataLama = ""; 
 
@@ -78,18 +78,15 @@ async function getJadwalDariExcel(tanggalAngka = "", teksTanggal = "", targetDat
 // --- FUNGSI PEMBANTU: KONVERSI TANGGAL EXCEL KE TEKS ---
 function formatTanggalExcel(val) {
     if (!val) return "-";
-    
-    // Jika bentuknya angka (Excel Serial Date), konversi ke format Indonesia
     if (!isNaN(val) && val > 40000) {
         const date = new Date(Math.round((val - 25569) * 86400 * 1000));
         const namaBulan = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
         return `${date.getDate()} ${namaBulan[date.getMonth()]} ${date.getFullYear()}`;
     }
-    
     return val.toString().trim();
 }
 
-// --- FUNGSI PARSING DATA (FIX: QTY + NAMA ALAT + FREQ) ---
+// --- FUNGSI PARSING DATA ---
 function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
     let daftarPesanWA = [];
     let blocks = [];
@@ -136,47 +133,29 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
                 const crew = getVal(i, c + 6);
                 if (crew && crew !== "-" && crew !== "CREW" && crew !== "") crewList.push(crew);
                 
-                // --- PENENTUAN KOLOM EXCEL ---
-                const item = getVal(i, c + 1); // ITEM
-                const spec = getVal(i, c + 2); // SPESIFICATION
-                const qty  = getVal(i, c + 3); // QTY
-                const freq = getVal(i, c + 5); // FREQUENCY (Berapa hari)
+                const item = getVal(i, c + 1); 
+                const spec = getVal(i, c + 2); 
+                const qty  = getVal(i, c + 3); 
+                const freq = getVal(i, c + 5); 
 
                 if (qty && item && item.toUpperCase() !== "ITEM") {
-                    // Hasilnya: "* 2 Projector 5000 Lumen (1 hari)"
                     let teksAlat = `* ${qty} ${item} ${spec}`;
-                    if (freq && freq !== "-") {
-                        teksAlat += ` (${freq})`; // Tambahkan durasi jika ada
-                    }
+                    if (freq && freq !== "-") teksAlat += ` (${freq})`; 
                     itemList.push(teksAlat.replace(/\s+/g, ' ').trim());
                 }
             }
 
-            // let msg = `📢 *JADWAL EVENT [TGL ${masterTanggal}]* 📢\n\n`;
-            // msg += `🏢 *Klien:* ${companyName} (${customerName})\n`;
-            // msg += `🎪 *Event:* ${eventTitle}\n`;
-            // msg += `📍 *Venue:* ${venue}\n`;
-            // msg += `📅 *Tgl:* ${dateEvent}\n`;
-            // msg += `⏰ *Loading:* ${loadingDate}\n\n`;
-            // msg += `👥 *Crew:* ${crewList.length > 0 ? crewList.join(', ') : '-'}\n\n`;
-            // msg += `🎛️ *Daftar Alat:*\n${itemList.length > 0 ? itemList.join('\n') : '- Data alat kosong -'}`;
-
-            // --- IDE TEMPLATE PESAN LEBIH RAPI ---
             let msg = `━━━━━ 📝 *DETAIL EVENT* ━━━━━\n\n`;
-
-            // SEKTOR INFO UTAMA
             msg += `📌 *EVENT:* ${eventTitle}\n`;
             msg += `🏢 *KLIEN:* ${companyName}\n`;
             msg += `📍 *VENUE:* ${venue}\n`;
             msg += `📅 *TANGGAL:* ${dateEvent}\n`;
             msg += `🚚 *LOADING:* ${loadingDate}\n\n`;
 
-            // SEKTOR TIM
             msg += `👥 *TIM BERTUGAS (CREW):*\n`;
             msg += crewList.length > 0 ? crewList.map(c => `   ◦ ${c}`).join('\n') : `   - (Belum ada kru)`;
             msg += `\n\n`;
 
-            // SEKTOR ALAT (Menggunakan bullet point yang konsisten)
             msg += `📦 *DAFTAR ALAT & DURASI:*\n`;
             if (itemList.length > 0) {
                 msg += itemList.join('\n');
@@ -185,17 +164,26 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
             }
 
             msg += `\n\n━━━━━━━━━━━━━━━━━━━━`;
-            
             daftarPesanWA.push(msg);
         }
     }
     return daftarPesanWA;
 }
 
-// --- WHATSAPP CLIENT ---
+// --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+    puppeteer: {
+        executablePath: '/usr/bin/google-chrome-stable',
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--pipe'
+        ]
+    }
 });
 
 client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
@@ -216,27 +204,52 @@ client.on('ready', async () => {
     }, 10 * 60 * 1000);
 });
 
+// --- FUNGSI SIMULASI NGETIK ---
+const simulateTyping = async (chat, text) => {
+    // Tandai pesan sudah dibaca (opsional, agar centang biru muncul duluan)
+    await chat.sendSeen(); 
+    
+    await chat.sendStateTyping();
+    // Hitung durasi: 50 milidetik per karakter + jeda mikir 500 milidetik
+    // Maksimal delay dibatasi 3 detik agar orang tidak menunggu kelamaan
+    let typingTime = (text.length * 50) + 500;
+    if (typingTime > 3000) typingTime = 3000; 
+    
+    await new Promise(resolve => setTimeout(resolve, typingTime));
+};
+
+// --- WHATSAPP MESSAGE HANDLER ---
 client.on('message', async (msg) => {
     const text = msg.body.toLowerCase().trim();
+    
+    // Tarik data chat untuk keperluan efek ngetik dan auto-read
+    const chat = await msg.getChat();
 
     if (['halo', 'menu', 'jadwal', 'bot'].includes(text)) {
-        await msg.reply(`🤖 *MENU JADWAL*\n\n1️⃣ Hari Ini\n2️⃣ Besok\n3️⃣ Semua Jadwal Bulan Ini`);
+        const balasanMenu = `🤖 *MENU JADWAL*\n\n1️⃣ Hari Ini\n2️⃣ Besok\n3️⃣ Semua Jadwal Bulan Ini`;
+        
+        await simulateTyping(chat, balasanMenu);
+        await msg.reply(balasanMenu);
     } 
     else if (['1', '2', '3'].includes(text)) {
         const date = new Date();
         let tgl = text === '1' ? date.getDate().toString() : (text === '2' ? (date.setDate(date.getDate() + 1), date.getDate().toString()) : "");
         let label = text === '1' ? "Hari Ini" : (text === '2' ? "Besok" : "Semua Jadwal Bulan Ini");
 
-        await msg.reply(`⏳ Menarik data ${label}...`);
+        const balasanTunggu = `⏳ Menarik data ${label}...`;
+        await simulateTyping(chat, balasanTunggu);
+        await msg.reply(balasanTunggu);
+        
         const daftarPesan = await getJadwalDariExcel(tgl, label, date);
         
-        // PENGIRIMAN PESAN BERTAHAP (Anti-Crash)
         if (daftarPesan.length === 0 || typeof daftarPesan === 'string') {
-            await msg.reply(typeof daftarPesan === 'string' ? daftarPesan : `ℹ️ Tidak ada jadwal untuk ${label}.`);
+            const balasanKosong = typeof daftarPesan === 'string' ? daftarPesan : `ℹ️ Tidak ada jadwal untuk ${label}.`;
+            await simulateTyping(chat, balasanKosong);
+            await msg.reply(balasanKosong);
         } else {
             for (const pesan of daftarPesan) {
+                await simulateTyping(chat, pesan);
                 await client.sendMessage(msg.from, pesan);
-                // Beri jeda 1 detik tiap pesan agar tidak kena spam block
                 await new Promise(res => setTimeout(res, 1000));
             }
         }
