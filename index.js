@@ -88,26 +88,41 @@ function formatTanggalExcel(val) {
 
 // --- FUNGSI PARSING DATA ---
 // --- FUNGSI PEMBANTU: PENYORTIR KATEGORI ALAT ---
+// --- FUNGSI PEMBANTU: PENYORTIR KATEGORI ALAT (VERSI UPDATE INVENTORY) ---
 function tentukanKategori(namaAlat) {
     const teks = namaAlat.toLowerCase();
-    
-    // Kategori VISUAL
-    if (teks.includes('videotron') || teks.includes('tv') || teks.includes('monitor') || teks.includes('projector') || teks.includes('screen')) {
-        return "📺 VISUAL";
+
+    const kamusKategori = {
+        "📺 VISUAL & MULTIMEDIA": [
+            'videotron', 'tv', 'monitor', 'projector', 'screen', 'kamera', 
+            'switcher', 'klicker', 'perfect cue', 'laptop', 'timer'
+        ],
+        "💡 LIGHTING": [
+            'moving', 'strobe', 'fresnel', 'par led', 'avolite', 'grandma', 'grand ma',
+            'lighting', 'beam', 'smoke', 'hazer', 'efx', 'minuit', 'tripod t'
+        ],
+        "🔊 SOUND & BACKLINE": [
+            'console', 'speaker', 'subwoofer', 'mic', 'yamaha', 'midas', 
+            'dl32', 'foh', 'mixer', 'in ear', 'stand mic', 'audio focus', 
+            'iem', 'drumset', 'tama', 'sound system', 'milan', 'sp milan', 
+            'pa ', 'senheiser', 'sennheiser', 'roland', 'akustika'
+        ],
+        "🏗️ RIGGING & STAGING": [
+            'rigging', 'rig', 'gawangan', 'level', 'aluminium', 'stage', 
+            'barikade', 'tenda'
+        ],
+        "⚡ POWER": [
+            'genset', 'kabel', 'power', 'panel', 'distro'
+        ]
+    };
+
+    for (const [kategori, kataKunciArray] of Object.entries(kamusKategori)) {
+        const cocok = kataKunciArray.some(kataKunci => teks.includes(kataKunci));
+        if (cocok) {
+            return kategori;
+        }
     }
-    // Kategori LIGHTING
-    else if (teks.includes('moving') || teks.includes('strobe') || teks.includes('fresnel') || teks.includes('par led') || teks.includes('avolite') || teks.includes('grandma') || teks.includes('lighting') || teks.includes('beam')) {
-        return "💡 LIGHTING";
-    }
-    // Kategori SOUND
-    else if (teks.includes('console') || teks.includes('speaker') || teks.includes('subwoofer') || teks.includes('mic') || teks.includes('yamaha') || teks.includes('midas') || teks.includes('dl32') || teks.includes('foh') || teks.includes('mixer')) {
-        return "🔊 SOUND";
-    }
-    // Kategori POWER
-    else if (teks.includes('genset') || teks.includes('kabel') || teks.includes('power') || teks.includes('panel')) {
-        return "⚡ POWER";
-    }
-    // Jika tidak masuk ke mana-mana
+
     return "📦 LAINNYA"; 
 }
 
