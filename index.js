@@ -323,14 +323,14 @@ client.on('message', async (msg) => {
 
     if (['halo', 'menu', 'jadwal', 'bot'].includes(text)) {
         const balasanMenu = `━━━━━━━━━━━━━━━━━━
-            📅 *JADWAL EVENT*
-            ━━━━━━━━━━━━━━━━━━
+📅 *JADWAL EVENT*
+━━━━━━━━━━━━━━━━━━
 
-            1️⃣ 📍 Hari Ini
-            2️⃣ 📍 Besok
-            3️⃣ 📆 Bulan Ini
+1️⃣ 📍 Hari Ini
+2️⃣ 📍 Besok
+3️⃣ 📆 Bulan Ini
 
-            ✏️ Ketik nomor menu`;
+✏️ Ketik nomor menu`;
         
         await simulateTyping(chat, balasanMenu);
         await msg.reply(balasanMenu);
