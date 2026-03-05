@@ -173,15 +173,7 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
 // --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: {
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--pipe'
-        ]
-    }
+    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] }
 });
 
 client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
