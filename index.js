@@ -103,8 +103,14 @@ function tentukanKategori(namaAlat) {
 
     // 2. KAMUS UTAMA
     const kamusKategori = {
-        "⚡ POWER": [
+         "⚡ POWER": [
             'genset', 'kabel', 'power', 'panel', 'distro'
+        ],
+        "💡 LIGHTING": [
+            'moving', 'strobe', 'fresnel', 'par led', 'par light', 'nuovoled', 'avolite', 
+            'grandma', 'grand ma', 'lighting', 'beam', 'smoke', 'hazer', 'efx', 'minuit', 
+            'tripod t', 'follow spot', 'folow spot', 'spot led', 'blinder', 'par zoom',
+            'atomic' // Tambahan untuk Strobe Atomic
         ],
         "🔊 SOUND & BACKLINE": [
             'console', 'speaker', 'subwoofer', 'mic', 'yamaha', 'midas', 
@@ -121,12 +127,6 @@ function tentukanKategori(namaAlat) {
             'sony', 'hollyland', 'streaming', 'vmix', 'internet', 'orbit', 'vj', 'visual',
             'procesor', 'processor', 'magimage', 'led outdoor', 'led p',
             'black magic', 'blackmagic' // Tambahan untuk Blackmagic Design
-        ],
-        "💡 LIGHTING": [
-            'moving', 'strobe', 'fresnel', 'par led', 'par light', 'nuovoled', 'avolite', 
-            'grandma', 'grand ma', 'lighting', 'beam', 'smoke', 'hazer', 'efx', 'minuit', 
-            'tripod t', 'follow spot', 'folow spot', 'spot led', 'blinder', 'par zoom',
-            'atomic' // Tambahan untuk Strobe Atomic
         ],
         "🏗️ RIGGING & STAGING": [
             'rigging', 'rig', 'gawangan', 'level', 'aluminium', 'stage', 
