@@ -174,8 +174,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        executablePath: '/usr/bin/google-chrome-stable',
-        headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
