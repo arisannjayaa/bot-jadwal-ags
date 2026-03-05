@@ -164,11 +164,13 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
             
             let crewList = [];
             
-            // Siapkan wadah untuk masing-masing kategori
+            // --- INI YANG HARUS DIPERBAIKI ---
+            // Wadah ini namanya HARUS SAMA PERSIS dengan hasil dari tentukanKategori()
             let kategoriAlat = {
-                "📺 VISUAL": [],
+                "📺 VISUAL & MULTIMEDIA": [],
                 "💡 LIGHTING": [],
-                "🔊 SOUND": [],
+                "🔊 SOUND & BACKLINE": [],
+                "🏗️ RIGGING & STAGING": [],
                 "⚡ POWER": [],
                 "📦 LAINNYA": []
             };
@@ -189,13 +191,19 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
                     let namaLengkap = `${item} ${spec}`.trim();
                     let teksAlat = `• ${qty} ${namaLengkap}`;
                     
-                    if (freq && freq !== "-") teksAlat += ` (${freq})`; // Durasi jika ada
+                    if (freq && freq !== "-") teksAlat += ` (${freq})`;
                     
                     teksAlat = teksAlat.replace(/\s+/g, ' ').trim();
                     
-                    // Sortir otomatis masukkan ke kotak yang tepat
+                    // Proses sortir
                     let namaKategori = tentukanKategori(namaLengkap);
-                    kategoriAlat[namaKategori].push(teksAlat);
+                    
+                    // Pastikan kategori ada sebelum di-push (Mencegah error undefined)
+                    if (kategoriAlat[namaKategori]) {
+                        kategoriAlat[namaKategori].push(teksAlat);
+                    } else {
+                        kategoriAlat["📦 LAINNYA"].push(teksAlat);
+                    }
                 }
             }
 
@@ -231,7 +239,14 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
 // --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-background-timer-throttling',] }
+    puppeteer: { 
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-background-timer-throttling',
+            '--disable-dev-shm-usage',
+        ]
+    }
 });
 
 client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
