@@ -6,8 +6,8 @@ const readline = require('readline');
 const XLSX = require('xlsx');
 
 // --- KONFIGURASI ---
-const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
-// const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
+// const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
+const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
 const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us';
 
 let objekDataLama = null;
@@ -302,7 +302,7 @@ function ekstrakStateEvent(rawData) {
                 namaTampil = venue || "Event Tanpa Nama";
             }
             
-            let eventKey = `${dateStr}_${c}_${namaTampil}`; 
+            let eventKey = `${dateStr}_${c}_${namaTampil}`;
             
             let crewList = [];
             let statusEvent = "";
@@ -314,18 +314,33 @@ function ekstrakStateEvent(rawData) {
                 isiEventLengkap.push(barisString);
 
                 if (i >= 8) {
-                    const marker = getVal(i, c).toUpperCase();
-                    
-                    if (marker.includes("STATUS")) {
-                        let stat = getVal(i, c+1);
-                        if(!stat || stat === "-") stat = getVal(i, c+6);
-                        statusEvent = stat;
-                    }
-                    if (marker.includes("CUSTOMER")) break;
+                    // Cek isi seluruh baris ini
+                    let teksBaris = barisString.toUpperCase();
+                    let isStatusRow = teksBaris.includes("STATUS");
+                    let isCustomerRow = teksBaris.includes("CUSTOMER");
 
+                    if (isCustomerRow) break; // Berhenti jika sudah sampai bawah (Customer)
+
+                    // Jika baris ini ada tulisan STATUS
+                    if (isStatusRow) {
+                        let stat = getVal(i, c+1); // Coba ambil di sebelah kata Status
+                        if (!stat || stat === "-" || stat.toUpperCase() === "STATUS") stat = getVal(i, c+6); // Coba ambil di kolom crew
+                        if (stat && stat !== "-") statusEvent = stat;
+                    }
+
+                    // Ambil isi dari kolom Crew
                     const crew = getVal(i, c + 6);
-                    if (crew && crew !== "-" && crew !== "CREW" && crew !== "" && !marker.includes("STATUS")) {
-                        crewList.push(crew);
+                    if (crew && crew !== "-" && crew.toUpperCase() !== "CREW" && crew !== "") {
+                        let crewUpper = crew.toUpperCase();
+                        
+                        // JEBAKAN KHUSUS: Pastikan Done/Cancel tidak masuk ke daftar kru
+                        if (crewUpper === "DONE" || crewUpper === "CANCEL" || crewUpper === "CANCELLED") {
+                            statusEvent = crew; // Timpa sebagai Status
+                        } 
+                        // Jika bukan Done/Cancel, dan bukan baris Status, masukkan ke Crew
+                        else if (!isStatusRow) {
+                            crewList.push(crew);
+                        }
                     }
                 }
             }
