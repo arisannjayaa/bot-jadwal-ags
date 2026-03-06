@@ -401,7 +401,7 @@ client.on('ready', async () => {
         } catch (err) {
             console.error('❌ Gagal meronda:', err.message);
         }
-    }, 5 * 60 * 1000);
+    }, 1 * 60 * 1000);
 });
 
 const simulateTyping = async (chat, text) => {
