@@ -137,31 +137,36 @@ function tentukanKategori(namaAlat) {
     return "📦 LAINNYA";
 }
 function cariPerubahanEvent(dataLama, dataBaru) {
-    let revisiTerdeteksi = [];
+    let stateLama = ekstrakStateEvent(dataLama);
+    let stateBaru = ekstrakStateEvent(dataBaru);
+    let hasilPerubahan = [];
 
-    dataBaru.forEach((rowBaru, index) => {
-        const rowLama = dataLama[index];
+    for (let key in stateBaru) {
+        let baru = stateBaru[key];
+        let lama = stateLama[key];
 
-        if (JSON.stringify(rowBaru) !== JSON.stringify(rowLama)) {
+        // Jika ini event baru, ATAU data event lama isinya berubah (hash beda)
+        if (!lama || lama.hash !== baru.hash) {
             
-            let namaEvent = "";
-            let tanggalEvent = "";
-
-            for (let c = 8; c < rowBaru.length; c++) {
-                const val = rowBaru[c] ? rowBaru[c].toString().trim() : "";
-                if (val && val !== "-" && val !== "Event Tittle" && val !== "NAME") {
-                    namaEvent = val;
-                    break;
-                }
+            // 1. Judul Event & Tanggal
+            let msg = `📌 *${baru.nama}* (${baru.tanggal})`;
+            
+            // 2. Daftar Crew
+            if (baru.crew.length > 0) {
+                msg += `\n👥 *Crew:* ${baru.crew.join(', ')}`;
+            } else {
+                msg += `\n👥 *Crew:* (Belum diplot)`;
             }
 
-            if (namaEvent && !revisiTerdeteksi.includes(namaEvent)) {
-                revisiTerdeteksi.push(namaEvent);
+            // 3. Status (Hanya muncul jika diisi)
+            if (baru.status && baru.status !== "-") {
+                msg += `\n🏷️ *Status:* ${baru.status.toUpperCase()}`;
             }
+
+            hasilPerubahan.push(msg);
         }
-    });
-
-    return revisiTerdeteksi;
+    }
+    return hasilPerubahan;
 }
 
 function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
@@ -270,6 +275,86 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
     return daftarPesanWA;
 }
 
+function ekstrakStateEvent(rawData) {
+    let state = {};
+    if (!rawData || !Array.isArray(rawData)) return state;
+
+    let blocks = [];
+    let currentBlock = [];
+    
+    // Pisahkan per blok nomor urut (sama seperti logika pesan WA Bapak)
+    for (let i = 0; i < rawData.length; i++) {
+        const row = rawData[i];
+        const colA = row && row[0] ? row[0].toString().trim() : "";
+        if (/^\d+$/.test(colA)) {
+            if (currentBlock.length > 0) blocks.push(currentBlock);
+            currentBlock = [row];
+        } else if (currentBlock.length > 0) {
+            currentBlock.push(row);
+        }
+    }
+    if (currentBlock.length > 0) blocks.push(currentBlock);
+
+    for (const block of blocks) {
+        for (let c = 2; c < 50; c += 8) {
+            const getVal = (r, col) => (block[r] && block[r][col] ? block[r][col].toString().trim() : "");
+            
+            if (getVal(1, c).toUpperCase() !== "NAME") continue;
+            
+            let eventTitle = getVal(2, c + 6);
+            let venue = getVal(3, c + 6);
+            let dateRaw = block[1] ? block[1][c+6] : "-";
+            let dateStr = formatTanggalExcel(dateRaw);
+            
+            // Ambil Venue jika Nama Event kosong
+            let namaTampil = eventTitle;
+            if (!namaTampil || namaTampil === "-" || namaTampil === "Event Tittle" || namaTampil === "") {
+                namaTampil = venue || "Event Tanpa Nama";
+            }
+            
+            let eventKey = `${dateStr}_${c}_${namaTampil}`; // Kunci unik per event
+            
+            let crewList = [];
+            let statusEvent = "";
+            let isiEventLengkap = [];
+
+            for (let i = 1; i < block.length; i++) {
+                // Rekam semua isi baris untuk deteksi perubahan (termasuk alat)
+                let barisString = "";
+                for(let k = c; k <= c+7; k++) barisString += getVal(i, k) + "|";
+                isiEventLengkap.push(barisString);
+
+                if (i >= 8) {
+                    const marker = getVal(i, c).toUpperCase();
+                    
+                    // Cek Status (bisa di kolom sebelahnya atau di kolom crew)
+                    if (marker.includes("STATUS")) {
+                        let stat = getVal(i, c+1);
+                        if(!stat || stat === "-") stat = getVal(i, c+6);
+                        statusEvent = stat;
+                    }
+                    if (marker.includes("CUSTOMER")) break; // Batas bawah event
+
+                    // Cek Crew
+                    const crew = getVal(i, c + 6);
+                    if (crew && crew !== "-" && crew !== "CREW" && crew !== "" && !marker.includes("STATUS")) {
+                        crewList.push(crew);
+                    }
+                }
+            }
+            
+            state[eventKey] = {
+                nama: namaTampil,
+                tanggal: dateStr,
+                crew: crewList,
+                status: statusEvent,
+                hash: isiEventLengkap.join("~") // Sidik jari data event ini
+            };
+        }
+    }
+    return state;
+}
+
 // --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -318,7 +403,7 @@ client.on('ready', async () => {
         } catch (err) {
             console.error('❌ Gagal meronda:', err.message);
         }
-    }, 5 * 60 * 1000); // Ronda setiap 5 menit (lebih responsif)
+    }, 1 * 60 * 1000); // Ronda setiap 5 menit (lebih responsif)
 });
 
 // --- FUNGSI SIMULASI NGETIK ---
