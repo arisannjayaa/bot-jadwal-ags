@@ -6,8 +6,8 @@ const readline = require('readline');
 const XLSX = require('xlsx');
 
 // --- KONFIGURASI ---
-// const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
-const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
+const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
+// const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
 const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us';
 
 let objekDataLama = null;
@@ -145,20 +145,15 @@ function cariPerubahanEvent(dataLama, dataBaru) {
         let baru = stateBaru[key];
         let lama = stateLama[key];
 
-        // Jika ini event baru, ATAU data event lama isinya berubah (hash beda)
         if (!lama || lama.hash !== baru.hash) {
-            
-            // 1. Judul Event & Tanggal
             let msg = `📌 *${baru.nama}* (${baru.tanggal})`;
             
-            // 2. Daftar Crew
             if (baru.crew.length > 0) {
                 msg += `\n👥 *Crew:* ${baru.crew.join(', ')}`;
             } else {
                 msg += `\n👥 *Crew:* (Belum diplot)`;
             }
 
-            // 3. Status (Hanya muncul jika diisi)
             if (baru.status && baru.status !== "-") {
                 msg += `\n🏷️ *Status:* ${baru.status.toUpperCase()}`;
             }
@@ -234,10 +229,8 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
                     
                     teksAlat = teksAlat.replace(/\s+/g, ' ').trim();
                     
-                    // Proses sortir
                     let namaKategori = tentukanKategori(namaLengkap);
                     
-                    // Pastikan kategori ada sebelum di-push (Mencegah error undefined)
                     if (kategoriAlat[namaKategori]) {
                         kategoriAlat[namaKategori].push(teksAlat);
                     } else {
@@ -246,7 +239,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
                 }
             }
 
-            // --- MULAI MENYUSUN PESAN SESUAI TEMPLATE ---
             let msg = `━━━━━━━━━━━━━━━━━━━━\n📝 *EVENT DETAIL*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
             
             msg += `📌 *EVENT* : ${eventTitle}\n`;
@@ -282,7 +274,6 @@ function ekstrakStateEvent(rawData) {
     let blocks = [];
     let currentBlock = [];
     
-    // Pisahkan per blok nomor urut (sama seperti logika pesan WA Bapak)
     for (let i = 0; i < rawData.length; i++) {
         const row = rawData[i];
         const colA = row && row[0] ? row[0].toString().trim() : "";
@@ -306,20 +297,18 @@ function ekstrakStateEvent(rawData) {
             let dateRaw = block[1] ? block[1][c+6] : "-";
             let dateStr = formatTanggalExcel(dateRaw);
             
-            // Ambil Venue jika Nama Event kosong
             let namaTampil = eventTitle;
             if (!namaTampil || namaTampil === "-" || namaTampil === "Event Tittle" || namaTampil === "") {
                 namaTampil = venue || "Event Tanpa Nama";
             }
             
-            let eventKey = `${dateStr}_${c}_${namaTampil}`; // Kunci unik per event
+            let eventKey = `${dateStr}_${c}_${namaTampil}`; 
             
             let crewList = [];
             let statusEvent = "";
             let isiEventLengkap = [];
 
             for (let i = 1; i < block.length; i++) {
-                // Rekam semua isi baris untuk deteksi perubahan (termasuk alat)
                 let barisString = "";
                 for(let k = c; k <= c+7; k++) barisString += getVal(i, k) + "|";
                 isiEventLengkap.push(barisString);
@@ -327,15 +316,13 @@ function ekstrakStateEvent(rawData) {
                 if (i >= 8) {
                     const marker = getVal(i, c).toUpperCase();
                     
-                    // Cek Status (bisa di kolom sebelahnya atau di kolom crew)
                     if (marker.includes("STATUS")) {
                         let stat = getVal(i, c+1);
                         if(!stat || stat === "-") stat = getVal(i, c+6);
                         statusEvent = stat;
                     }
-                    if (marker.includes("CUSTOMER")) break; // Batas bawah event
+                    if (marker.includes("CUSTOMER")) break;
 
-                    // Cek Crew
                     const crew = getVal(i, c + 6);
                     if (crew && crew !== "-" && crew !== "CREW" && crew !== "" && !marker.includes("STATUS")) {
                         crewList.push(crew);
@@ -348,14 +335,13 @@ function ekstrakStateEvent(rawData) {
                 tanggal: dateStr,
                 crew: crewList,
                 status: statusEvent,
-                hash: isiEventLengkap.join("~") // Sidik jari data event ini
+                hash: isiEventLengkap.join("~")
             };
         }
     }
     return state;
 }
 
-// --- WHATSAPP CLIENT DENGAN KONFIGURASI SERVER ---
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
@@ -374,7 +360,6 @@ client.on('ready', async () => {
     console.log('✅ Bot Siap!');
     
     const dataAwal = await getJadwalDariExcel("", "RONDA", new Date());
-    console.log('dataawal: ' + dataAwal);
     let objekDataLama = dataAwal; 
 
     setInterval(async () => {
@@ -383,8 +368,7 @@ client.on('ready', async () => {
             const dataTerbaru = await getJadwalDariExcel("", "RONDA", new Date());
             
             if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
-                
-                // Cari tahu event mana yang berubah
+                console.log('ada perubahan');
                 const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
 
                 if (daftarRevisi.length > 0) {
@@ -397,49 +381,36 @@ client.on('ready', async () => {
                     await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
                 }
 
-                // Update memori data lama agar tidak terus-terusan kirim notif
                 objekDataLama = dataTerbaru;
             }
         } catch (err) {
             console.error('❌ Gagal meronda:', err.message);
         }
-    }, 1 * 60 * 1000); // Ronda setiap 5 menit (lebih responsif)
+    }, 5 * 60 * 1000);
 });
 
-// --- FUNGSI SIMULASI NGETIK ---
 const simulateTyping = async (chat, text) => {
-    // Tandai pesan sudah dibaca (opsional, agar centang biru muncul duluan)
     await chat.sendSeen(); 
-    
     await chat.sendStateTyping();
-    // Hitung durasi: 50 milidetik per karakter + jeda mikir 500 milidetik
-    // Maksimal delay dibatasi 3 detik agar orang tidak menunggu kelamaan
     let typingTime = (text.length * 50) + 500;
     if (typingTime > 3000) typingTime = 3000; 
     
     await new Promise(resolve => setTimeout(resolve, typingTime));
 };
 
-// --- SISTEM ANTI-ZOMBIE (AUTO RESTART) ---
-
-// 1. Jika WhatsApp memutus koneksi
 client.on('disconnected', (reason) => {
     console.log('❌ Bot terputus dari WhatsApp! Alasan:', reason);
     console.log('🔄 Mematikan proses agar direstart ulang oleh PM2...');
-    process.exit(1); // Ini akan memaksa Node.js mati, dan PM2 akan otomatis menghidupkannya lagi
+    process.exit(1); 
 });
 
-// 2. Jika ada error tak terduga (agar script tidak nge-hang)
 process.on('unhandledRejection', (error) => {
     console.error('⚠️ Ada error tak tertangkap:', error.message);
-    // Jangan di-exit di sini, cukup log saja agar bot tetap jalan
 });
 
 // --- WHATSAPP MESSAGE HANDLER ---
 client.on('message', async (msg) => {
     const text = msg.body.toLowerCase().trim();
-    
-    // Tarik data chat untuk keperluan efek ngetik dan auto-read
     const chat = await msg.getChat();
 
     if (['halo', 'menu', 'jadwal', 'bot'].includes(text)) {
@@ -466,7 +437,6 @@ client.on('message', async (msg) => {
         await msg.reply(balasanTunggu);
         
         const daftarPesan = await getJadwalDariExcel(tgl, label, date);
-        console.log('daftarpesan: ' + daftarPesan)
         
         if (daftarPesan.length === 0 || typeof daftarPesan === 'string') {
             const balasanKosong = typeof daftarPesan === 'string' ? daftarPesan : `ℹ️ Tidak ada jadwal untuk ${label}.`;
