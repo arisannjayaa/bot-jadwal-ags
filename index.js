@@ -289,6 +289,7 @@ client.on('ready', async () => {
     console.log('✅ Bot Siap!');
     
     const dataAwal = await getJadwalDariExcel("", "RONDA", new Date());
+    console.log('dataawal: ' + dataAwal);
     let objekDataLama = dataAwal; 
 
     setInterval(async () => {
@@ -380,6 +381,7 @@ client.on('message', async (msg) => {
         await msg.reply(balasanTunggu);
         
         const daftarPesan = await getJadwalDariExcel(tgl, label, date);
+        console.log('daftarpesan: ' + daftarPesan)
         
         if (daftarPesan.length === 0 || typeof daftarPesan === 'string') {
             const balasanKosong = typeof daftarPesan === 'string' ? daftarPesan : `ℹ️ Tidak ada jadwal untuk ${label}.`;
