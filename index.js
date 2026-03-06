@@ -10,7 +10,7 @@ const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
 // const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
 const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us';
 
-let memoriDataLama = ""; 
+let objekDataLama = null;
 
 // --- SISTEM LOGIN OAUTH 2.0 ---
 async function authorize() {
@@ -75,7 +75,6 @@ async function getJadwalDariExcel(tanggalAngka = "", teksTanggal = "", targetDat
     }
 }
 
-// --- FUNGSI PEMBANTU: KONVERSI TANGGAL EXCEL KE TEKS ---
 function formatTanggalExcel(val) {
     if (!val) return "-";
     if (!isNaN(val) && val > 40000) {
@@ -86,22 +85,16 @@ function formatTanggalExcel(val) {
     return val.toString().trim();
 }
 
-// --- FUNGSI PARSING DATA ---
-// --- FUNGSI PEMBANTU: PENYORTIR KATEGORI ALAT ---
-// --- FUNGSI PEMBANTU: PENYORTIR KATEGORI ALAT (VERSI UPDATE INVENTORY) ---
 function tentukanKategori(namaAlat) {
     const teks = namaAlat.toLowerCase();
 
-  // 1. JALUR VIP (PENGECUALIAN KHUSUS ANTI-NYASAR)
     if (teks.includes('drum riser') || teks.includes('riser')) return "🏗️ RIGGING & STAGING";
     if (teks.includes('genset lighting')) return "⚡ POWER";
     if (teks.includes('panel visual') || teks.includes('panel audio')) return "⚡ POWER";
     
-    // Pengecualian Baru:
     if (teks.includes('video mixer') || teks.includes('black magic')) return "📺 VISUAL & MULTIMEDIA";
     if (teks.includes('stage i/o') || teks.includes('analog snake')) return "🔊 SOUND & BACKLINE";
 
-    // 2. KAMUS UTAMA
     const kamusKategori = {
          "⚡ POWER": [
             'genset', 'kabel', 'power', 'panel', 'distro'
@@ -110,7 +103,7 @@ function tentukanKategori(namaAlat) {
             'moving', 'strobe', 'fresnel', 'par led', 'par light', 'nuovoled', 'avolite', 
             'grandma', 'grand ma', 'lighting', 'beam', 'smoke', 'hazer', 'efx', 'minuit', 
             'tripod t', 'follow spot', 'folow spot', 'spot led', 'blinder', 'par zoom',
-            'atomic' // Tambahan untuk Strobe Atomic
+            'atomic'
         ],
         "🔊 SOUND & BACKLINE": [
             'console', 'speaker', 'subwoofer', 'mic', 'yamaha', 'midas', 
@@ -119,14 +112,14 @@ function tentukanKategori(namaAlat) {
             'pa ', 'senheiser', 'sennheiser', 'roland', 'akustika',
             'stage monitor', 'musician monitor', 'dbr', 'dxs', 'audio',
             'pdp', 'dw', 'cymbal', 'paiste', 'amplifier', 'gallien', 'krueger', 'head',
-            'snake' // Tambahan untuk snake cable
+            'snake'
         ],
         "📺 VISUAL & MULTIMEDIA": [
             'videotron', 'tv', 'monitor', 'projector', 'screen', 'kamera', 'camera',
             'cam ', 'switcher', 'klicker', 'perfect cue', 'laptop', 'timer', 
             'sony', 'hollyland', 'streaming', 'vmix', 'internet', 'orbit', 'vj', 'visual',
             'procesor', 'processor', 'magimage', 'led outdoor', 'led p',
-            'black magic', 'blackmagic' // Tambahan untuk Blackmagic Design
+            'black magic', 'blackmagic' 
         ],
         "🏗️ RIGGING & STAGING": [
             'rigging', 'rig', 'gawangan', 'level', 'aluminium', 'stage', 
@@ -143,8 +136,34 @@ function tentukanKategori(namaAlat) {
 
     return "📦 LAINNYA";
 }
+function cariPerubahanEvent(dataLama, dataBaru) {
+    let revisiTerdeteksi = [];
 
-// --- FUNGSI PARSING DATA (VERSI TEMPLATE PREMIUM) ---
+    dataBaru.forEach((rowBaru, index) => {
+        const rowLama = dataLama[index];
+
+        if (JSON.stringify(rowBaru) !== JSON.stringify(rowLama)) {
+            
+            let namaEvent = "";
+            let tanggalEvent = "";
+
+            for (let c = 8; c < rowBaru.length; c++) {
+                const val = rowBaru[c] ? rowBaru[c].toString().trim() : "";
+                if (val && val !== "-" && val !== "Event Tittle" && val !== "NAME") {
+                    namaEvent = val;
+                    break;
+                }
+            }
+
+            if (namaEvent && !revisiTerdeteksi.includes(namaEvent)) {
+                revisiTerdeteksi.push(namaEvent);
+            }
+        }
+    });
+
+    return revisiTerdeteksi;
+}
+
 function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
     let daftarPesanWA = [];
     let blocks = [];
@@ -181,9 +200,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
             const loadingDate  = getVal(4, c + 6) || "-";
             
             let crewList = [];
-            
-            // --- INI YANG HARUS DIPERBAIKI ---
-            // Wadah ini namanya HARUS SAMA PERSIS dengan hasil dari tentukanKategori()
             let kategoriAlat = {
                 "📺 VISUAL & MULTIMEDIA": [],
                 "💡 LIGHTING": [],
@@ -271,18 +287,37 @@ client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
 
 client.on('ready', async () => {
     console.log('✅ Bot Siap!');
+    
     const dataAwal = await getJadwalDariExcel("", "RONDA", new Date());
-    memoriDataLama = JSON.stringify(dataAwal);
+    let objekDataLama = dataAwal; 
 
     setInterval(async () => {
         console.log('🕵️ Meronda...');
-        const dataTerbaruRaw = await getJadwalDariExcel("", "RONDA", new Date());
-        const dataTerbaruStr = JSON.stringify(dataTerbaruRaw);
-        if (memoriDataLama !== "" && dataTerbaruStr !== memoriDataLama) {
-            await client.sendMessage(ID_TUJUAN_NOTIFIKASI, `🚨 *ALARM REVISI ADMIN* 🚨\n\nAda perubahan data di Excel! Ketik *1* atau *2* untuk cek.`);
-            memoriDataLama = dataTerbaruStr;
+        try {
+            const dataTerbaru = await getJadwalDariExcel("", "RONDA", new Date());
+            
+            if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
+                
+                // Cari tahu event mana yang berubah
+                const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
+
+                if (daftarRevisi.length > 0) {
+                    let teksDaftar = daftarRevisi.map(item => `• *${item}*`).join('\n');
+                    
+                    const pesanNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\n` +
+                                     `Admin baru saja mengubah data pada event:\n${teksDaftar}\n\n` +
+                                     `💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
+
+                    await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
+                }
+
+                // Update memori data lama agar tidak terus-terusan kirim notif
+                objekDataLama = dataTerbaru;
+            }
+        } catch (err) {
+            console.error('❌ Gagal meronda:', err.message);
         }
-    }, 10 * 60 * 1000);
+    }, 5 * 60 * 1000); // Ronda setiap 5 menit (lebih responsif)
 });
 
 // --- FUNGSI SIMULASI NGETIK ---
