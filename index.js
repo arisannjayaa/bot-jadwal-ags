@@ -6,8 +6,8 @@ const readline = require('readline');
 const XLSX = require('xlsx');
 
 // --- KONFIGURASI ---
-// const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
-const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
+const SPREADSHEET_ID = '1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_'; // real
+// const SPREADSHEET_ID = '18-wJoQ6yLvz17cK0vyNuKyfDs6dhT-8M';
 const ID_TUJUAN_NOTIFIKASI = '628970282769@c.us';
 
 let objekDataLama = null;
