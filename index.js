@@ -10,11 +10,10 @@ const SPREADSHEET_ID = "1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_"; // real
 const ID_TUJUAN_NOTIFIKASI = "628970282769@c.us";
 
 let objekDataLama = null;
-let globalAuthClient = null; // ⬅️ FIX: Cache Auth Client agar tidak spam request login ke Google
+let globalAuthClient = null;
 
 // --- SISTEM LOGIN OAUTH 2.0 ---
 async function authorize() {
-  // Gunakan sesi yang sudah ada jika tersedia (mencegah ETIMEDOUT akibat concurrent requests)
   if (globalAuthClient) return globalAuthClient;
 
   let content;
@@ -69,54 +68,7 @@ async function getNewToken(oAuth2Client) {
   });
 }
 
-// --- FUNGSI AMBIL DATA EXCEL ---
-async function getJadwalDariExcel(
-  tanggalAngka = "",
-  teksTanggal = "",
-  targetDateObj = new Date(),
-) {
-  const authClient = await authorize();
-  const drive = google.drive({ version: "v3", auth: authClient });
-
-  try {
-    const res = await drive.files.get(
-      { fileId: SPREADSHEET_ID, alt: "media" },
-      { responseType: "arraybuffer" },
-    );
-    const workbook = XLSX.read(res.data, { type: "buffer" });
-
-    const namaBulan = [
-      "JANUARI",
-      "FEBRUARI",
-      "MARET",
-      "APRIL",
-      "MEI",
-      "JUNI",
-      "JULI",
-      "AGUSTUS",
-      "SEPTEMBER",
-      "OKTOBER",
-      "NOVEMBER",
-      "DESEMBER",
-    ];
-    const targetSheetName = `${namaBulan[targetDateObj.getMonth()]} ${targetDateObj.getFullYear()}`;
-
-    const worksheet = workbook.Sheets[targetSheetName];
-    if (!worksheet) return [`❌ Tab *${targetSheetName}* tidak ditemukan.`];
-
-    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-
-    if (teksTanggal === "RONDA") return rows;
-
-    return prosesDataKePesanWA(rows, tanggalAngka, teksTanggal);
-  } catch (error) {
-    console.error("❌ Gagal mengunduh file Excel:", error.message);
-    return [
-      "❌ Gagal mengunduh file Excel dari Google Drive. Server mungkin sedang sibuk.",
-    ];
-  }
-}
-
+// --- FUNGSI BANTUAN ---
 function formatTanggalExcel(val) {
   if (!val) return "-";
   if (!isNaN(val) && val > 40000) {
@@ -138,6 +90,21 @@ function formatTanggalExcel(val) {
     return `${date.getDate()} ${namaBulan[date.getMonth()]} ${date.getFullYear()}`;
   }
   return val.toString().trim();
+}
+
+function cleanStr(str) {
+  if (!str) return "";
+  const s = str.toString().trim();
+  const upper = s.toUpperCase();
+  if (
+    s === "-" ||
+    upper === "EVENT TITTLE" ||
+    upper === "VENUE" ||
+    upper === "COMPANY" ||
+    upper === "NAME"
+  )
+    return "";
+  return s;
 }
 
 function tentukanKategori(namaAlat) {
@@ -263,41 +230,57 @@ function tentukanKategori(namaAlat) {
   };
 
   for (const [kategori, kataKunciArray] of Object.entries(kamusKategori)) {
-    const cocok = kataKunciArray.some((kataKunci) => teks.includes(kataKunci));
-    if (cocok) {
+    if (kataKunciArray.some((kataKunci) => teks.includes(kataKunci)))
       return kategori;
-    }
   }
-
   return "📦 LAINNYA";
 }
 
-function cariPerubahanEvent(dataLama, dataBaru) {
-  let stateLama = ekstrakStateEvent(dataLama);
-  let stateBaru = ekstrakStateEvent(dataBaru);
-  let hasilPerubahan = [];
+// --- FUNGSI AMBIL DATA EXCEL ---
+async function getJadwalDariExcel(
+  tanggalAngka = "",
+  teksTanggal = "",
+  targetDateObj = new Date(),
+) {
+  const authClient = await authorize();
+  const drive = google.drive({ version: "v3", auth: authClient });
 
-  for (let key in stateBaru) {
-    let baru = stateBaru[key];
-    let lama = stateLama[key];
+  try {
+    const res = await drive.files.get(
+      { fileId: SPREADSHEET_ID, alt: "media" },
+      { responseType: "arraybuffer" },
+    );
+    const workbook = XLSX.read(res.data, { type: "buffer" });
 
-    if (!lama || lama.hash !== baru.hash) {
-      let msg = `📌 *${baru.nama}* (${baru.tanggal})`;
+    const namaBulan = [
+      "JANUARI",
+      "FEBRUARI",
+      "MARET",
+      "APRIL",
+      "MEI",
+      "JUNI",
+      "JULI",
+      "AGUSTUS",
+      "SEPTEMBER",
+      "OKTOBER",
+      "NOVEMBER",
+      "DESEMBER",
+    ];
+    const targetSheetName = `${namaBulan[targetDateObj.getMonth()]} ${targetDateObj.getFullYear()}`;
 
-      if (baru.crew.length > 0) {
-        msg += `\n👥 *Crew:* ${baru.crew.join(", ")}`;
-      } else {
-        msg += `\n👥 *Crew:* (Belum diplot)`;
-      }
+    const worksheet = workbook.Sheets[targetSheetName];
+    if (!worksheet) return [`❌ Tab *${targetSheetName}* tidak ditemukan.`];
 
-      if (baru.status && baru.status !== "-") {
-        msg += `\n🏷️ *Status:* ${baru.status.toUpperCase()}`;
-      }
+    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+    if (teksTanggal === "RONDA") return rows;
 
-      hasilPerubahan.push(msg);
-    }
+    return prosesDataKePesanWA(rows, tanggalAngka, teksTanggal);
+  } catch (error) {
+    console.error("❌ Gagal mengunduh file Excel:", error.message);
+    return [
+      "❌ Gagal mengunduh file Excel dari Google Drive. Server mungkin sedang sibuk.",
+    ];
   }
-  return hasilPerubahan;
 }
 
 function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
@@ -327,19 +310,25 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
 
       if (getVal(1, c).toUpperCase() !== "NAME") continue;
 
-      const eventTitle = getVal(2, c + 6);
-      if (
-        !eventTitle ||
-        eventTitle === "-" ||
-        eventTitle === "Event Tittle" ||
-        eventTitle === ""
-      )
-        continue;
+      // Ekstrak data dan fallback jika kosong
+      const picName = cleanStr(getVal(1, c + 1));
+      const companyName = cleanStr(getVal(2, c + 1));
+      let eventTitle = cleanStr(getVal(2, c + 6));
+      const venue = cleanStr(getVal(3, c + 6));
 
-      const companyName = getVal(2, c + 1) || "-";
-      const dateEventRaw = block[1] ? block[1][c + 6] : "-";
+      // Jika semuanya kosong, berarti ini kolom template kosong
+      if (!picName && !companyName && !eventTitle && !venue) continue;
+
+      // Jika Event Tittle tidak diisi admin, pakai Venue atau nama yg ada
+      if (!eventTitle) {
+        if (venue) eventTitle = venue;
+        else if (companyName) eventTitle = companyName;
+        else if (picName) eventTitle = picName;
+        else eventTitle = "Event Tanpa Nama";
+      }
+
+      const dateEventRaw = getVal(1, c + 6);
       const dateEvent = formatTanggalExcel(dateEventRaw);
-      const venue = getVal(3, c + 6) || "-";
       const loadingDate = getVal(4, c + 6) || "-";
 
       let crewList = [];
@@ -353,12 +342,31 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
       };
 
       for (let i = 8; i < block.length; i++) {
-        const marker = getVal(i, c).toUpperCase();
-        if (marker.includes("STATUS") || marker.includes("CUSTOMER")) break;
+        // Cek baris STATUS yang benar dengan menggabungkan string sebaris
+        let rowString = "";
+        for (let k = c; k <= c + 7; k++) {
+          rowString += getVal(i, k).toUpperCase() + "|";
+        }
+
+        if (
+          rowString.includes("STATUS|") ||
+          rowString.includes("CUSTOMER DETILS|")
+        ) {
+          break; // Berhenti dengan benar
+        }
 
         const crew = getVal(i, c + 6);
-        if (crew && crew !== "-" && crew !== "CREW" && crew !== "")
-          crewList.push(crew);
+        if (crew && crew !== "-" && crew.toUpperCase() !== "CREW") {
+          const upCrew = crew.toUpperCase();
+          // Pastikan "Done" atau "Cancel" tidak masuk ke nama Crew
+          if (
+            upCrew !== "DONE" &&
+            upCrew !== "CANCEL" &&
+            upCrew !== "CANCELLED"
+          ) {
+            if (!crewList.includes(crew)) crewList.push(crew);
+          }
+        }
 
         const item = getVal(i, c + 1);
         const spec = getVal(i, c + 2);
@@ -368,13 +376,10 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
         if (qty && item && item.toUpperCase() !== "ITEM") {
           let namaLengkap = `${item} ${spec}`.trim();
           let teksAlat = `• ${qty} ${namaLengkap}`;
-
           if (freq && freq !== "-") teksAlat += ` (${freq})`;
-
           teksAlat = teksAlat.replace(/\s+/g, " ").trim();
 
           let namaKategori = tentukanKategori(namaLengkap);
-
           if (kategoriAlat[namaKategori]) {
             kategoriAlat[namaKategori].push(teksAlat);
           } else {
@@ -384,10 +389,9 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", teksTanggal = "") {
       }
 
       let msg = `━━━━━━━━━━━━━━━━━━━━\n📝 *EVENT DETAIL*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-
       msg += `📌 *EVENT* : ${eventTitle}\n`;
-      msg += `🏢 *CLIENT* : ${companyName}\n`;
-      msg += `📍 *VENUE* : ${venue}\n`;
+      msg += `🏢 *CLIENT* : ${companyName || "-"}\n`;
+      msg += `📍 *VENUE* : ${venue || "-"}\n`;
       msg += `📅 *DATE* : ${dateEvent}\n`;
       msg += `🚚 *LOADING*: ${loadingDate}\n\n`;
 
@@ -438,21 +442,23 @@ function ekstrakStateEvent(rawData) {
 
       if (getVal(1, c).toUpperCase() !== "NAME") continue;
 
-      let eventTitle = getVal(2, c + 6);
-      let venue = getVal(3, c + 6);
-      let dateRaw = block[1] ? block[1][c + 6] : "-";
-      let dateStr = formatTanggalExcel(dateRaw);
+      const picName = cleanStr(getVal(1, c + 1));
+      const companyName = cleanStr(getVal(2, c + 1));
+      let eventTitle = cleanStr(getVal(2, c + 6));
+      const venue = cleanStr(getVal(3, c + 6));
+
+      if (!picName && !companyName && !eventTitle && !venue) continue;
 
       let namaTampil = eventTitle;
-      if (
-        !namaTampil ||
-        namaTampil === "-" ||
-        namaTampil === "Event Tittle" ||
-        namaTampil === ""
-      ) {
-        namaTampil = venue || "Event Tanpa Nama";
+      if (!namaTampil) {
+        if (venue) namaTampil = venue;
+        else if (companyName) namaTampil = companyName;
+        else if (picName) namaTampil = picName;
+        else namaTampil = "Event Tanpa Nama";
       }
 
+      let dateRaw = getVal(1, c + 6);
+      let dateStr = formatTanggalExcel(dateRaw);
       let eventKey = `${dateStr}_${c}_${namaTampil}`;
 
       let crewList = [];
@@ -466,16 +472,14 @@ function ekstrakStateEvent(rawData) {
 
         if (i >= 8) {
           let teksBaris = barisString.toUpperCase();
-          let isStatusRow = teksBaris.includes("STATUS");
-          let isCustomerRow = teksBaris.includes("CUSTOMER");
+          if (teksBaris.includes("CUSTOMER DETILS|")) break;
 
-          if (isCustomerRow) break;
-
-          if (isStatusRow) {
+          if (teksBaris.includes("STATUS|")) {
             let stat = getVal(i, c + 1);
             if (!stat || stat === "-" || stat.toUpperCase() === "STATUS")
               stat = getVal(i, c + 6);
             if (stat && stat !== "-") statusEvent = stat;
+            break;
           }
 
           const crew = getVal(i, c + 6);
@@ -486,15 +490,14 @@ function ekstrakStateEvent(rawData) {
             crew !== ""
           ) {
             let crewUpper = crew.toUpperCase();
-
             if (
               crewUpper === "DONE" ||
               crewUpper === "CANCEL" ||
               crewUpper === "CANCELLED"
             ) {
               statusEvent = crew;
-            } else if (!isStatusRow) {
-              crewList.push(crew);
+            } else {
+              if (!crewList.includes(crew)) crewList.push(crew);
             }
           }
         }
@@ -510,6 +513,29 @@ function ekstrakStateEvent(rawData) {
     }
   }
   return state;
+}
+
+function cariPerubahanEvent(dataLama, dataBaru) {
+  let stateLama = ekstrakStateEvent(dataLama);
+  let stateBaru = ekstrakStateEvent(dataBaru);
+  let hasilPerubahan = [];
+
+  for (let key in stateBaru) {
+    let baru = stateBaru[key];
+    let lama = stateLama[key];
+
+    if (!lama || lama.hash !== baru.hash) {
+      let msg = `📌 *${baru.nama}* (${baru.tanggal})`;
+      msg +=
+        baru.crew.length > 0
+          ? `\n👥 *Crew:* ${baru.crew.join(", ")}`
+          : `\n👥 *Crew:* (Belum diplot)`;
+      if (baru.status && baru.status !== "-")
+        msg += `\n🏷️ *Status:* ${baru.status.toUpperCase()}`;
+      hasilPerubahan.push(msg);
+    }
+  }
+  return hasilPerubahan;
 }
 
 const client = new Client({
@@ -549,12 +575,7 @@ client.on("ready", async () => {
             let teksDaftar = daftarRevisi
               .map((item) => `• *${item}*`)
               .join("\n");
-
-            const pesanNotif =
-              `🚨 *ALARM REVISI ADMIN* 🚨\n\n` +
-              `Admin baru saja mengubah data pada event:\n${teksDaftar}\n\n` +
-              `💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
-
+            const pesanNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nAdmin baru saja mengubah data pada event:\n${teksDaftar}\n\n💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
             await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
           }
 
@@ -571,15 +592,13 @@ client.on("ready", async () => {
 const simulateTyping = async (chat, text) => {
   await chat.sendSeen();
   await chat.sendStateTyping();
-  let typingTime = text.length * 30 + 500; // ⬅️ Dipercepat sedikit
+  let typingTime = text.length * 30 + 500;
   if (typingTime > 2000) typingTime = 2000;
-
   await new Promise((resolve) => setTimeout(resolve, typingTime));
 };
 
 client.on("disconnected", (reason) => {
   console.log("❌ Bot terputus dari WhatsApp! Alasan:", reason);
-  console.log("🔄 Mematikan proses agar direstart ulang oleh PM2...");
   process.exit(1);
 });
 
@@ -587,18 +606,15 @@ process.on("unhandledRejection", (error) => {
   console.error("⚠️ Ada error tak tertangkap:", error.message);
 });
 
-// --- WHATSAPP MESSAGE HANDLER ---
 client.on("message", async (msg) => {
   const text = msg.body.toLowerCase().trim();
   const chat = await msg.getChat();
 
   if (["halo", "menu", "jadwal", "bot"].includes(text)) {
     const balasanMenu = `━━━━━━━━━━━━━━━━━━\n📅 *JADWAL EVENT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Hari Ini\n2️⃣ 📍 Besok\n3️⃣ 📆 Bulan Ini\n\n✏️ Ketik nomor menu`;
-
     await simulateTyping(chat, balasanMenu);
     await msg.reply(balasanMenu);
   } else if (["1", "2", "3"].includes(text)) {
-    // ⬅️ FIX: Penentuan tanggal diisolasi supaya tidak saling memutasi data referensi satu sama lain.
     const dateObj = new Date();
     let tglTarget = "";
     let labelTarget = "";
@@ -607,7 +623,7 @@ client.on("message", async (msg) => {
       tglTarget = dateObj.getDate().toString();
       labelTarget = "Hari Ini";
     } else if (text === "2") {
-      dateObj.setDate(dateObj.getDate() + 1); // Tambah 1 hari
+      dateObj.setDate(dateObj.getDate() + 1);
       tglTarget = dateObj.getDate().toString();
       labelTarget = "Besok";
     } else if (text === "3") {
@@ -636,7 +652,7 @@ client.on("message", async (msg) => {
       for (const pesan of daftarPesan) {
         await simulateTyping(chat, pesan);
         await client.sendMessage(msg.from, pesan);
-        await new Promise((res) => setTimeout(res, 500)); // ⬅️ Delay dijeda 500ms agar koneksi WA stabil
+        await new Promise((res) => setTimeout(res, 500));
       }
     }
   }
