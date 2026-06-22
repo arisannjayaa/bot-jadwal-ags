@@ -607,6 +607,11 @@ process.on("unhandledRejection", (error) => {
 });
 
 client.on("message", async (msg) => {
+  // --- TAMBAHKAN KODE INI DI BARIS PERTAMA ---
+  // Jika pengirim BUKAN nomor Anda, hentikan proses (abaikan pesan)
+  if (msg.from !== ID_TUJUAN_NOTIFIKASI) return;
+  // -------------------------------------------
+
   const text = msg.body.toLowerCase().trim();
   const chat = await msg.getChat();
 
