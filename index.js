@@ -813,6 +813,40 @@ const simulateTyping = async (chat, text) => {
     } catch (error) {}
 };
 
+// Ambil nama admin yang terakhir mengedit spreadsheet, via Google Drive Revisions API.
+// Cukup pakai scope drive.readonly yang sudah ada (tidak perlu izin tambahan).
+// Catatan: ini atribusi per-FILE (siapa yang terakhir nyentuh file), bukan per-cell.
+async function getAdminTerakhirEdit() {
+    try {
+        const authClient = await authorize();
+        if (!authClient) return null;
+        const drive = google.drive({ version: "v3", auth: authClient });
+
+        let revisiTerakhir = null;
+        let pageToken = null;
+        do {
+            const res = await drive.revisions.list({
+                fileId: SPREADSHEET_ID,
+                fields: "nextPageToken, revisions(id, modifiedTime, lastModifyingUser(displayName, emailAddress))",
+                pageSize: 1000,
+                pageToken: pageToken || undefined,
+            });
+            const revisions = res.data.revisions || [];
+            if (revisions.length > 0) revisiTerakhir = revisions[revisions.length - 1];
+            pageToken = res.data.nextPageToken;
+        } while (pageToken);
+
+        if (!revisiTerakhir || !revisiTerakhir.lastModifyingUser) return null;
+        return {
+            nama: revisiTerakhir.lastModifyingUser.displayName || revisiTerakhir.lastModifyingUser.emailAddress || "Tidak diketahui",
+            waktu: revisiTerakhir.modifiedTime,
+        };
+    } catch (err) {
+        console.log("⚠️ Gagal ambil riwayat revisi (info admin dilewati):", err.message);
+        return null;
+    }
+}
+
 const jalankanRonda = async () => {
     console.log("🕵️ Meronda 2 Bulan Sekaligus...");
     try {
@@ -823,9 +857,29 @@ const jalankanRonda = async () => {
             console.log("🔔 Ada perubahan jadwal!");
             const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
             if (daftarRevisi.length > 0) {
-                let teksDaftar = daftarRevisi.map((item) => `• *${item}*`).join("\n");
-                const pesanNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nAdmin baru saja mengubah data pada event:\n${teksDaftar}\n\n💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
-                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
+                const adminInfo = await getAdminTerakhirEdit();
+
+                let headerNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nTerdeteksi *${daftarRevisi.length} perubahan* pada jadwal.`;
+                if (adminInfo) {
+                    const waktuFormat = new Date(adminInfo.waktu).toLocaleString("id-ID", {
+                        timeZone: "Asia/Makassar",
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                    });
+                    headerNotif += `\n✏️ *Diubah oleh:* ${adminInfo.nama}`;
+                    headerNotif += `\n🕒 *Waktu edit:* ${waktuFormat} WITA`;
+                }
+                headerNotif += `\n\nDetail lengkap di bawah ini:`;
+
+                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, headerNotif);
+
+                for (const detailPerubahan of daftarRevisi) {
+                    await new Promise((res) => setTimeout(res, 800));
+                    await client.sendMessage(ID_TUJUAN_NOTIFIKASI, detailPerubahan);
+                }
+
+                await new Promise((res) => setTimeout(res, 500));
+                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, `💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`);
             }
         }
         objekDataLama = dataTerbaru;
@@ -850,6 +904,11 @@ function ekstrakStateEvent(rawData) {
     if (currentBlock.length > 0) blocks.push(currentBlock);
 
     for (const block of blocks) {
+        // masterTanggal = nomor hari di kolom A (posisi baris/slot di sheet).
+        // Dipakai sebagai KUNCI STABIL agar perubahan tanggal event tetap terdeteksi
+        // sebagai "perubahan", bukan dianggap event baru.
+        const masterTanggal = block[0][0] ? block[0][0].toString().trim() : "";
+
         for (let c = 2; c < 50; c += 8) {
             const getVal = (r, col) => block[r] && block[r][col] ? block[r][col].toString().trim() : "";
             if (getVal(1, c).toUpperCase() !== "NAME") continue;
@@ -858,19 +917,21 @@ function ekstrakStateEvent(rawData) {
             let eventTitle = cleanStr(getVal(2, c + 6));
             const venue = cleanStr(getVal(3, c + 6));
             if (!picName && !companyName && !eventTitle && !venue) continue;
-            
+
             let namaTampil = eventTitle || venue || companyName || picName || "Event Tanpa Nama";
             let dateStr = formatTanggalExcel(getVal(1, c + 6));
-            let eventKey = `${dateStr}_${c}_${namaTampil}`;
-            
+            let loadingStr = getVal(4, c + 6) || "-";
+            let eventKey = `SLOT_${masterTanggal}_${c}`;
+
             let crewList = [];
             let statusEvent = "";
+            let itemList = [];
             let isiEventLengkap = [];
             for (let i = 1; i < block.length; i++) {
                 let barisString = "";
                 for (let k = c; k <= c + 7; k++) barisString += getVal(i, k) + "|";
                 isiEventLengkap.push(barisString);
-                
+
                 if (i >= 8) {
                     let teksBaris = barisString.toUpperCase();
                     if (teksBaris.includes("CUSTOMER DETILS|")) break;
@@ -886,28 +947,118 @@ function ekstrakStateEvent(rawData) {
                             statusEvent = crew;
                         } else if (!crewList.includes(crew)) crewList.push(crew);
                     }
+
+                    // Ambil data barang/alat di baris yang sama, supaya bisa dibandingkan (ditambah/dihapus)
+                    const item = getVal(i, c + 1);
+                    const spec = getVal(i, c + 2);
+                    const qty = getVal(i, c + 3);
+                    const freq = getVal(i, c + 5);
+                    if (qty && item && item.toUpperCase() !== "ITEM") {
+                        let namaLengkap = `${item} ${spec}`.trim().replace(/\s+/g, " ");
+                        let teksAlat = `${qty} ${namaLengkap}`.trim();
+                        if (freq && freq !== "-") teksAlat += ` (${freq})`;
+                        itemList.push(teksAlat);
+                    }
                 }
             }
-            state[eventKey] = { nama: namaTampil, tanggal: dateStr, crew: crewList, status: statusEvent, hash: isiEventLengkap.join("~") };
+            state[eventKey] = {
+                nama: namaTampil,
+                tanggal: dateStr,
+                loading: loadingStr,
+                venue: venue,
+                company: companyName,
+                crew: crewList,
+                status: statusEvent,
+                items: itemList,
+                hash: isiEventLengkap.join("~"),
+            };
         }
     }
     return state;
+}
+
+// Bandingkan 2 array string, hasilkan { ditambah: [...], dihapus: [...] }
+function diffArray(arrLama, arrBaru) {
+    const ditambah = arrBaru.filter((x) => !arrLama.includes(x));
+    const dihapus = arrLama.filter((x) => !arrBaru.includes(x));
+    return { ditambah, dihapus };
 }
 
 function cariPerubahanEvent(dataLama, dataBaru) {
     let stateLama = ekstrakStateEvent(dataLama);
     let stateBaru = ekstrakStateEvent(dataBaru);
     let hasilPerubahan = [];
+
+    // 1. Cek slot yang ada di data terbaru (event baru / event yang berubah)
     for (let key in stateBaru) {
         let baru = stateBaru[key];
         let lama = stateLama[key];
-        if (!lama || lama.hash !== baru.hash) {
-            let msg = `📌 *${baru.nama}* (${baru.tanggal})`;
-            msg += baru.crew.length > 0 ? `\n👥 *Crew:* ${baru.crew.join(", ")}` : `\n👥 *Crew:* (Belum diplot)`;
-            if (baru.status && baru.status !== "-") msg += `\n🏷️ *Status:* ${baru.status.toUpperCase()}`;
+
+        // Slot ini sebelumnya kosong / belum tercatat -> anggap Event Baru
+        if (!lama) {
+            let msg = `🆕 *EVENT BARU*\n📌 *${baru.nama}*\n📅 Tanggal: ${baru.tanggal}`;
+            if (baru.venue && baru.venue !== "-") msg += `\n📍 Venue: ${baru.venue}`;
+            msg += baru.crew.length > 0 ? `\n👥 Crew: ${baru.crew.join(", ")}` : `\n👥 Crew: (Belum diplot)`;
+            if (baru.items.length > 0) msg += `\n📦 Barang: ${baru.items.length} item terpasang`;
             hasilPerubahan.push(msg);
+            continue;
+        }
+
+        if (lama.hash === baru.hash) continue; // benar-benar tidak ada perubahan
+
+        let detail = [];
+
+        if (lama.nama !== baru.nama) {
+            detail.push(`📝 *Nama/Judul Event:*\n   "${lama.nama}" ➡️ "${baru.nama}"`);
+        }
+        if (lama.tanggal !== baru.tanggal) {
+            detail.push(`📅 *Tanggal Event:*\n   ${lama.tanggal} ➡️ ${baru.tanggal}`);
+        }
+        if (lama.loading !== baru.loading) {
+            detail.push(`🚚 *Tanggal Loading:*\n   ${lama.loading} ➡️ ${baru.loading}`);
+        }
+        if (lama.venue !== baru.venue) {
+            detail.push(`📍 *Venue:*\n   ${lama.venue || "-"} ➡️ ${baru.venue || "-"}`);
+        }
+        if (lama.company !== baru.company) {
+            detail.push(`🏢 *Client/Company:*\n   ${lama.company || "-"} ➡️ ${baru.company || "-"}`);
+        }
+        if (lama.status !== baru.status) {
+            detail.push(`🏷️ *Status:*\n   ${lama.status || "(kosong)"} ➡️ ${baru.status || "(kosong)"}`);
+        }
+
+        const crewDiff = diffArray(lama.crew, baru.crew);
+        if (crewDiff.ditambah.length > 0 || crewDiff.dihapus.length > 0) {
+            let crewMsg = `👥 *Crew berubah:*`;
+            if (crewDiff.dihapus.length > 0) crewMsg += `\n   ➖ Dicopot: ${crewDiff.dihapus.join(", ")}`;
+            if (crewDiff.ditambah.length > 0) crewMsg += `\n   ➕ Ditugaskan: ${crewDiff.ditambah.join(", ")}`;
+            detail.push(crewMsg);
+        }
+
+        const itemDiff = diffArray(lama.items, baru.items);
+        if (itemDiff.ditambah.length > 0 || itemDiff.dihapus.length > 0) {
+            let itemMsg = `📦 *Barang berubah:*`;
+            if (itemDiff.dihapus.length > 0) itemMsg += `\n   ➖ Dihapus: ${itemDiff.dihapus.join(", ")}`;
+            if (itemDiff.ditambah.length > 0) itemMsg += `\n   ➕ Ditambahkan: ${itemDiff.ditambah.join(", ")}`;
+            detail.push(itemMsg);
+        }
+
+        if (detail.length === 0) {
+            detail.push(`ℹ️ Ada perubahan kecil pada data mentah (misal spasi/format), tidak signifikan.`);
+        }
+
+        let msg = `📌 *${baru.nama}* (${baru.tanggal})\n` + detail.join("\n");
+        hasilPerubahan.push(msg);
+    }
+
+    // 2. Cek slot yang hilang di data terbaru (event dihapus dari sheet)
+    for (let key in stateLama) {
+        if (!stateBaru[key]) {
+            let lama = stateLama[key];
+            hasilPerubahan.push(`🗑️ *EVENT DIHAPUS*\n📌 *${lama.nama}* (${lama.tanggal}) sudah tidak ada lagi di sheet.`);
         }
     }
+
     return hasilPerubahan;
 }
 
