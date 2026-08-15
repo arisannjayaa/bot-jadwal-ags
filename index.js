@@ -5,6 +5,7 @@ const fs = require("fs").promises;
 const readline = require("readline");
 const XLSX = require("xlsx");
 const cron = require("node-cron");
+const https = require("https");
 
 // ============================================================================
 // 1. KONFIGURASI UTAMA
@@ -15,6 +16,18 @@ const NAMA_SAYA_DI_ABSEN = "JAYAK"; // Sesuai tulisan di absen admin
 
 const ID_TUJUAN_NOTIFIKASI = "628970282769@c.us";
 const WAKTU_RONDA_MS = 1 * 60 * 1000; // 1 Menit
+
+// ============================================================================
+// KONFIGURASI THROTTLE, RATE LIMIT & RELIABILITAS
+// ============================================================================
+const JEDA_MINIMAL_NOTIF_MS = 3 * 60 * 1000; // Jeda minimal antar notifikasi revisi (3 menit)
+const JEDA_ANTAR_PESAN_MS = 1200; // Jeda antar pesan WA terkirim, biar gak kena flag spam
+const MAX_RETRY_RECONNECT = 3; // Percobaan reconnect otomatis sebelum proses di-restart PM2
+
+// Isi 2 baris ini kalau mau notifikasi fallback ke Telegram saat WA down.
+// Kosongkan (biarkan string kosong) kalau belum mau pakai fitur ini.
+const TELEGRAM_BOT_TOKEN = ""; // Token dari @BotFather
+const TELEGRAM_CHAT_ID = ""; // Chat ID tujuan notifikasi fallback
 
 // ============================================================================
 // KONFIGURASI SIKLUS KONTRAK
@@ -32,6 +45,19 @@ const NAMA_BULAN_ID = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni
 let objekDataLama = null; 
 let globalAuthClient = null;
 let isBotReady = false;
+
+// State untuk throttle notifikasi revisi
+let antrianPerubahanPending = [];
+let waktuNotifTerakhir = 0;
+
+// State untuk rate limit pengiriman pesan WA (antrian serial)
+let antrianKirimWA = Promise.resolve();
+
+// State untuk retry reconnect otomatis
+let jumlahRetryReconnect = 0;
+
+// Cache hasil cek konflik jadwal terakhir, buat dedupe notifikasi
+let daftarKonflikSebelumnya = [];
 
 // ============================================================================
 // 2. SISTEM LOGIN OAUTH 2.0
@@ -795,11 +821,61 @@ const client = new Client({
     puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] },
 });
 
+// Kirim pesan Telegram sebagai fallback, dipakai saat WA down/putus koneksi.
+// Pakai modul https bawaan Node biar gak nambah dependency & aman di versi Node manapun.
+function kirimTelegramFallback(text) {
+    return new Promise((resolve) => {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+            resolve(false);
+            return;
+        }
+        try {
+            const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "Markdown" });
+            const req = https.request(
+                {
+                    hostname: "api.telegram.org",
+                    path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
+                },
+                (res) => {
+                    res.on("data", () => {});
+                    res.on("end", () => resolve(true));
+                }
+            );
+            req.on("error", (err) => {
+                console.log("⚠️ Gagal kirim fallback Telegram:", err.message);
+                resolve(false);
+            });
+            req.write(payload);
+            req.end();
+        } catch (err) {
+            console.log("⚠️ Gagal kirim fallback Telegram:", err.message);
+            resolve(false);
+        }
+    });
+}
+
+// Kirim pesan WA lewat antrian serial (rate limit guard), biar gak kena flag spam
+// WhatsApp kalau banyak pesan meletus bersamaan (misal banyak revisi terdeteksi sekaligus).
+function kirimWA(target, text) {
+    antrianKirimWA = antrianKirimWA
+        .then(() => client.sendMessage(target, text))
+        .catch((err) => console.log("⚠️ Gagal kirim WA:", err.message))
+        .then(() => new Promise((res) => setTimeout(res, JEDA_ANTAR_PESAN_MS)));
+    return antrianKirimWA;
+}
+
 const sendSystemAlert = async (text) => {
     console.log(text);
     if (isBotReady) {
-        try { await client.sendMessage(ID_TUJUAN_NOTIFIKASI, text); } catch (e) {}
+        try {
+            await kirimWA(ID_TUJUAN_NOTIFIKASI, text);
+            return;
+        } catch (e) {}
     }
+    // WA belum siap / gagal kirim -> coba fallback ke Telegram
+    await kirimTelegramFallback(text);
 };
 
 const simulateTyping = async (chat, text) => {
@@ -847,6 +923,35 @@ async function getAdminTerakhirEdit() {
     }
 }
 
+// Kirim semua revisi yang tertampung di antrian, lalu reset antrian & cooldown.
+async function kirimNotifikasiRevisi() {
+    if (antrianPerubahanPending.length === 0) return;
+
+    const daftarRevisi = antrianPerubahanPending;
+    antrianPerubahanPending = [];
+    waktuNotifTerakhir = Date.now();
+
+    const adminInfo = await getAdminTerakhirEdit();
+
+    let headerNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nTerdeteksi *${daftarRevisi.length} perubahan* pada jadwal.`;
+    if (adminInfo) {
+        const waktuFormat = new Date(adminInfo.waktu).toLocaleString("id-ID", {
+            timeZone: "Asia/Makassar",
+            dateStyle: "medium",
+            timeStyle: "short",
+        });
+        headerNotif += `\n✏️ *Diubah oleh:* ${adminInfo.nama}`;
+        headerNotif += `\n🕒 *Waktu edit:* ${waktuFormat} WITA`;
+    }
+    headerNotif += `\n\nDetail lengkap di bawah ini:`;
+
+    await kirimWA(ID_TUJUAN_NOTIFIKASI, headerNotif);
+    for (const detailPerubahan of daftarRevisi) {
+        await kirimWA(ID_TUJUAN_NOTIFIKASI, detailPerubahan);
+    }
+    await kirimWA(ID_TUJUAN_NOTIFIKASI, `💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`);
+}
+
 const jalankanRonda = async () => {
     console.log("🕵️ Meronda 2 Bulan Sekaligus...");
     try {
@@ -855,34 +960,23 @@ const jalankanRonda = async () => {
 
         if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
             console.log("🔔 Ada perubahan jadwal!");
-            const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
-            if (daftarRevisi.length > 0) {
-                const adminInfo = await getAdminTerakhirEdit();
-
-                let headerNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nTerdeteksi *${daftarRevisi.length} perubahan* pada jadwal.`;
-                if (adminInfo) {
-                    const waktuFormat = new Date(adminInfo.waktu).toLocaleString("id-ID", {
-                        timeZone: "Asia/Makassar",
-                        dateStyle: "medium",
-                        timeStyle: "short",
-                    });
-                    headerNotif += `\n✏️ *Diubah oleh:* ${adminInfo.nama}`;
-                    headerNotif += `\n🕒 *Waktu edit:* ${waktuFormat} WITA`;
-                }
-                headerNotif += `\n\nDetail lengkap di bawah ini:`;
-
-                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, headerNotif);
-
-                for (const detailPerubahan of daftarRevisi) {
-                    await new Promise((res) => setTimeout(res, 800));
-                    await client.sendMessage(ID_TUJUAN_NOTIFIKASI, detailPerubahan);
-                }
-
-                await new Promise((res) => setTimeout(res, 500));
-                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, `💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`);
+            const daftarRevisiBaru = cariPerubahanEvent(objekDataLama, dataTerbaru);
+            if (daftarRevisiBaru.length > 0) {
+                antrianPerubahanPending.push(...daftarRevisiBaru);
             }
         }
         objekDataLama = dataTerbaru;
+
+        // Throttle: kirim sekarang kalau belum pernah kirim, atau cooldown-nya udah lewat.
+        // Kalau belum lewat cooldown, perubahan tetap ketampung di antrian dan
+        // baru dikirim gabungan begitu cooldown lewat (di ronda berikutnya).
+        const sudahLewatCooldown = Date.now() - waktuNotifTerakhir >= JEDA_MINIMAL_NOTIF_MS;
+        if (antrianPerubahanPending.length > 0 && sudahLewatCooldown) {
+            await kirimNotifikasiRevisi();
+        }
+
+        // Cek konflik jadwal (crew/alat bentrok di tanggal yang sama), dedupe otomatis
+        await cekDanNotifKonflikJadwal(dataTerbaru);
     } catch (err) {
         sendSystemAlert(`❌ Sistem Ronda Gagal: ${err.message}`);
     }
@@ -1062,11 +1156,115 @@ function cariPerubahanEvent(dataLama, dataBaru) {
     return hasilPerubahan;
 }
 
+// ============================================================================
+// 7. DETEKSI KONFLIK JADWAL (DOUBLE BOOKING) & PENCARIAN CREW/ALAT
+// ============================================================================
+
+// Cek apakah ada crew atau alat yang ke-assign ke lebih dari 1 event di tanggal yang sama.
+// Catatan: pencocokan alat murni berdasarkan nama (tanpa qty), jadi ini bukan cek stok
+// fisik (misal cuma ada 2 unit tapi dipesan 3 event) — cuma flag "dipakai bareng di tanggal sama".
+function cekKonflikJadwal(rawData) {
+    const state = ekstrakStateEvent(rawData);
+    const eventsByDate = {};
+
+    for (const key in state) {
+        const ev = state[key];
+        if (!ev.tanggal || ev.tanggal === "-") continue;
+        if (!eventsByDate[ev.tanggal]) eventsByDate[ev.tanggal] = [];
+        eventsByDate[ev.tanggal].push(ev);
+    }
+
+    let daftarKonflik = [];
+    for (const tanggal in eventsByDate) {
+        const events = eventsByDate[tanggal];
+        if (events.length < 2) continue;
+
+        // Cek crew bentrok
+        let crewMap = {};
+        for (const ev of events) {
+            for (const crew of ev.crew) {
+                if (!crewMap[crew]) crewMap[crew] = new Set();
+                crewMap[crew].add(ev.nama);
+            }
+        }
+        for (const crew in crewMap) {
+            const daftarEvent = [...crewMap[crew]];
+            if (daftarEvent.length > 1) {
+                daftarKonflik.push(
+                    `👤 *${crew}* ke-assign di ${daftarEvent.length} event tanggal ${tanggal}:\n` +
+                    daftarEvent.map((n) => `   • ${n}`).join("\n")
+                );
+            }
+        }
+
+        // Cek alat bentrok (nama barang tanpa qty di depan)
+        let itemMap = {};
+        for (const ev of events) {
+            for (const item of ev.items) {
+                const namaBarang = item.replace(/^\d+\s*/, "").trim().toUpperCase();
+                if (!namaBarang) continue;
+                if (!itemMap[namaBarang]) itemMap[namaBarang] = new Set();
+                itemMap[namaBarang].add(ev.nama);
+            }
+        }
+        for (const namaBarang in itemMap) {
+            const daftarEvent = [...itemMap[namaBarang]];
+            if (daftarEvent.length > 1) {
+                daftarKonflik.push(
+                    `📦 *${namaBarang}* dipakai di ${daftarEvent.length} event tanggal ${tanggal}:\n` +
+                    daftarEvent.map((n) => `   • ${n}`).join("\n")
+                );
+            }
+        }
+    }
+    return daftarKonflik;
+}
+
+// Bandingkan hasil cek konflik dengan hasil sebelumnya, kirim notif hanya untuk yang BARU
+// (biar gak spam notif yang sama tiap ronda selama konfliknya belum diselesaikan).
+async function cekDanNotifKonflikJadwal(rawData) {
+    const konflikSekarang = cekKonflikJadwal(rawData);
+    const konflikBaru = konflikSekarang.filter((k) => !daftarKonflikSebelumnya.includes(k));
+    daftarKonflikSebelumnya = konflikSekarang;
+
+    if (konflikBaru.length > 0) {
+        await kirimWA(ID_TUJUAN_NOTIFIKASI, `⚠️ *KONFLIK JADWAL TERDETEKSI* ⚠️\n\nDitemukan *${konflikBaru.length} bentrok baru*:`);
+        for (const k of konflikBaru) {
+            await kirimWA(ID_TUJUAN_NOTIFIKASI, k);
+        }
+    }
+}
+
+// Cari semua event yang melibatkan crew tertentu (pencocokan sebagian/contains, case-insensitive)
+function cariJadwalByCrew(rawData, namaCrew) {
+    const state = ekstrakStateEvent(rawData);
+    const target = namaCrew.toUpperCase();
+    let hasil = [];
+    for (const key in state) {
+        const ev = state[key];
+        if (ev.crew.some((c) => c.toUpperCase().includes(target))) hasil.push(ev);
+    }
+    return hasil;
+}
+
+// Cari semua event yang memakai alat/barang tertentu (pencocokan sebagian/contains, case-insensitive)
+function cariJadwalByAlat(rawData, namaAlat) {
+    const state = ekstrakStateEvent(rawData);
+    const target = namaAlat.toUpperCase();
+    let hasil = [];
+    for (const key in state) {
+        const ev = state[key];
+        if (ev.items.some((i) => i.toUpperCase().includes(target))) hasil.push(ev);
+    }
+    return hasil;
+}
+
 client.on("qr", (qr) => qrcode.generate(qr, { small: true }));
 
 client.on("ready", async () => {
     console.log("✅ Bot Siap!");
     isBotReady = true;
+    jumlahRetryReconnect = 0; // reset counter tiap kali berhasil connect
 
     objekDataLama = await getJadwalMultiBulan();
     setInterval(jalankanRonda, WAKTU_RONDA_MS);
@@ -1080,11 +1278,10 @@ client.on("ready", async () => {
 
             const daftarPesan = prosesDataKePesanWA(objekDataLama, tglHariIni, "");
             let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
-            await client.sendMessage(ID_TUJUAN_NOTIFIKASI, sapaanPagi);
+            await kirimWA(ID_TUJUAN_NOTIFIKASI, sapaanPagi);
 
             for (const pesan of daftarPesan) {
-                await new Promise((res) => setTimeout(res, 1000));
-                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesan);
+                await kirimWA(ID_TUJUAN_NOTIFIKASI, pesan);
             }
         } catch (error) {
             sendSystemAlert(`❌ Gagal mengirim Morning Briefing: ${error.message}`);
@@ -1094,9 +1291,33 @@ client.on("ready", async () => {
     sendSystemAlert("✅ AGS Bot Enterprise System Online!");
 });
 
-client.on("disconnected", (reason) => {
+client.on("disconnected", async (reason) => {
     console.log("❌ Bot terputus!", reason);
-    process.exit(1);
+    isBotReady = false;
+
+    // WA lagi down, jadi notif ini WAJIB lewat Telegram, bukan lewat WA itu sendiri
+    await kirimTelegramFallback(`⚠️ *WA Bot Terputus*\nAlasan: ${reason}\n\nMencoba reconnect otomatis...`);
+
+    // Kalau sesi di-logout manual/dihapus, retry gak ada gunanya - butuh scan QR ulang di server
+    if (reason === "LOGOUT") {
+        await kirimTelegramFallback(`🚪 Sesi WA logout. Perlu scan QR ulang manual di server, proses akan berhenti.`);
+        process.exit(1);
+        return;
+    }
+
+    if (jumlahRetryReconnect < MAX_RETRY_RECONNECT) {
+        jumlahRetryReconnect++;
+        const jedaRetry = 5000 * jumlahRetryReconnect; // backoff makin lama tiap percobaan
+        console.log(`🔄 Percobaan reconnect ke-${jumlahRetryReconnect}/${MAX_RETRY_RECONNECT} dalam ${jedaRetry / 1000}s...`);
+        setTimeout(() => {
+            client.initialize().catch((err) => {
+                console.log("❌ Reconnect gagal:", err.message);
+            });
+        }, jedaRetry);
+    } else {
+        await kirimTelegramFallback(`🛑 Reconnect otomatis gagal ${MAX_RETRY_RECONNECT}x. Proses akan di-restart lewat PM2.`);
+        process.exit(1);
+    }
 });
 
 process.on("unhandledRejection", (error) => {
@@ -1122,7 +1343,7 @@ client.on("message", async (msg) => {
     };
 
     if (["halo", "menu", "jadwal", "bot"].includes(text)) {
-        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Mendatang\n\n💰 *Keuangan & Slip Gaji:*\n• \`gaji\` (Bulan Berjalan)\n• \`gaji [bulan]\` (Contoh: \`gaji mei\`)\n• \`rekap tahun\` (Ringkasan Tahunan)\n• \`top venue\` (Peringkat Klien Terbesar)\n• \`proyeksi tabungan\` (Estimasi Saldo)\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n\n✏️ Ketik pilihan Anda...`;
+        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Mendatang\n\n💰 *Keuangan & Slip Gaji:*\n• \`gaji\` (Bulan Berjalan)\n• \`gaji [bulan]\` (Contoh: \`gaji mei\`)\n• \`rekap tahun\` (Ringkasan Tahunan)\n• \`top venue\` (Peringkat Klien Terbesar)\n• \`proyeksi tabungan\` (Estimasi Saldo)\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n\n👥 *Cek Personal:*\n• \`crew [nama]\` (Semua job crew tsb)\n• \`alat [nama]\` (Semua event yang pakai alat tsb)\n• \`cek konflik\` (Cek crew/alat bentrok jadwal)\n\n✏️ Ketik pilihan Anda...`;
         await balasPesan(balasanMenu);
     } 
     
@@ -1155,6 +1376,63 @@ client.on("message", async (msg) => {
         await balasPesan(`⏳ Menghitung proyeksi saldo tabungan akhir tahun...`);
         const hasilProyeksi = await getProyeksiTabungan(NAMA_SAYA_DI_ABSEN);
         await balasPesan(hasilProyeksi);
+    }
+
+    else if (text === "cek konflik" || text === "konflik jadwal") {
+        await balasPesan(`⏳ Mengecek bentrokan jadwal (crew & alat)...`);
+        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const hasilKonflik = cekKonflikJadwal(dataCek);
+        if (hasilKonflik.length === 0) {
+            await balasPesan(`✅ Tidak ada bentrokan jadwal terdeteksi untuk crew maupun alat.`);
+        } else {
+            await balasPesan(`⚠️ Ditemukan *${hasilKonflik.length} bentrokan*:`);
+            for (const k of hasilKonflik) {
+                await balasPesan(k);
+                await new Promise((res) => setTimeout(res, 500));
+            }
+        }
+    }
+
+    else if (text.startsWith("crew ")) {
+        const namaCrew = text.replace("crew ", "").trim();
+        if (namaCrew.length < 2) return balasPesan("⚠️ Nama crew terlalu pendek. Minimal 2 huruf.");
+
+        await balasPesan(`⏳ Mencari jadwal crew *${namaCrew.toUpperCase()}*...`);
+        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const hasil = cariJadwalByCrew(dataCek, namaCrew);
+
+        if (hasil.length === 0) {
+            await balasPesan(`ℹ️ Tidak ada jadwal ditemukan untuk crew *${namaCrew.toUpperCase()}*.`);
+        } else {
+            await balasPesan(`✅ Ditemukan *${hasil.length} job* untuk crew *${namaCrew.toUpperCase()}*:`);
+            for (const ev of hasil) {
+                let msg = `📌 *${ev.nama}*\n📅 ${ev.tanggal}\n📍 ${ev.venue || "-"}`;
+                if (ev.status) msg += `\n🏷️ Status: ${ev.status}`;
+                await balasPesan(msg);
+                await new Promise((res) => setTimeout(res, 500));
+            }
+        }
+    }
+
+    else if (text.startsWith("alat ")) {
+        const namaAlat = text.replace("alat ", "").trim();
+        if (namaAlat.length < 2) return balasPesan("⚠️ Nama alat terlalu pendek. Minimal 2 huruf.");
+
+        await balasPesan(`⏳ Mencari jadwal pemakaian alat *${namaAlat.toUpperCase()}*...`);
+        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const hasil = cariJadwalByAlat(dataCek, namaAlat);
+
+        if (hasil.length === 0) {
+            await balasPesan(`ℹ️ Tidak ada jadwal ditemukan untuk alat *${namaAlat.toUpperCase()}*.`);
+        } else {
+            await balasPesan(`✅ Alat *${namaAlat.toUpperCase()}* dipakai di *${hasil.length} event*:`);
+            for (const ev of hasil) {
+                const itemCocok = ev.items.filter((i) => i.toUpperCase().includes(namaAlat.toUpperCase()));
+                let msg = `📌 *${ev.nama}*\n📅 ${ev.tanggal}\n📦 ${itemCocok.join(", ")}`;
+                await balasPesan(msg);
+                await new Promise((res) => setTimeout(res, 500));
+            }
+        }
     }
 
     else if (text.startsWith("cari ") || text.startsWith("search ")) {
