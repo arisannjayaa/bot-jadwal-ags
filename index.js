@@ -4,23 +4,37 @@ const { google } = require("googleapis");
 const fs = require("fs").promises;
 const readline = require("readline");
 const XLSX = require("xlsx");
-const cron = require("node-cron"); // TAMBAHAN: Untuk fitur Daily Morning Briefing
+const cron = require("node-cron");
 
 // ============================================================================
 // 1. KONFIGURASI UTAMA
 // ============================================================================
-const SPREADSHEET_ID = "1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_";
+const SPREADSHEET_ID = "1DLcMkga8UiRtRJ3ZQIPMRQb-5d1IFiu_"; // Excel Jadwal
+const SPREADSHEET_ID_GAJI = "19QJEZ11K63KYfGfiT4ECSHodfsa_KgCpPz7gDg3UWxk"; // Excel Gaji
+const NAMA_SAYA_DI_ABSEN = "JAYAK"; // Sesuai tulisan di absen admin
+
 const ID_TUJUAN_NOTIFIKASI = "628970282769@c.us";
 const WAKTU_RONDA_MS = 1 * 60 * 1000; // 1 Menit
 
-// VARIABEL CACHE (In-Memory Caching)
-let objekDataLama = null; // Menyimpan raw data Excel secara global
+// ============================================================================
+// KONFIGURASI SIKLUS KONTRAK
+// ============================================================================
+const BULAN_MULAI_KONTRAK = 10; // 10 = Oktober. Ganti kalau kontrak beda tanggal mulai.
+
+const BULAN_MAP = {
+    "JANUARY": 1, "JANUARI": 1, "FEBRUARI": 2, "MARET": 3, "APRIL": 4,
+    "MEI": 5, "JUNI": 6, "JULI": 7, "AGUSTUS": 8, "SEPTEMBER": 9,
+    "OKTOBER": 10, "NOVEMBER": 11, "DESEMBER": 12
+};
+const NAMA_BULAN_ID = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+
+let objekDataLama = null; 
 let globalAuthClient = null;
 let isBotReady = false;
 
-
 // ============================================================================
-// 2. SISTEM LOGIN OAUTH 2.0 (STRICT - Tidak Diubah)
+// 2. SISTEM LOGIN OAUTH 2.0
 // ============================================================================
 async function authorize() {
     if (globalAuthClient) return globalAuthClient;
@@ -46,10 +60,7 @@ async function authorize() {
 }
 
 async function getNewToken(oAuth2Client) {
-    const authUrl = oAuth2Client.generateAuthUrl({
-        access_type: "offline",
-        scope: ["https://www.googleapis.com/auth/drive.readonly"],
-    });
+    const authUrl = oAuth2Client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/drive.readonly"] });
     console.log("\n=========================================\nBuka link ini:\n" + authUrl + "\n=========================================\n");
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => {
@@ -64,9 +75,40 @@ async function getNewToken(oAuth2Client) {
     });
 }
 
+// Parse nama sheet ("JULI 2026", "JANUARY 2026") jadi { bulanNum, tahun }
+function parseSheetBulanTahun(sheetName) {
+    const upper = sheetName.toUpperCase();
+    let bulanNum = null;
+    for (const key in BULAN_MAP) {
+        if (upper.includes(key)) { bulanNum = BULAN_MAP[key]; break; }
+    }
+    const tahunMatch = sheetName.match(/\d{4}/);
+    const tahunSheetIni = tahunMatch ? parseInt(tahunMatch[0]) : new Date().getFullYear();
+    return { bulanNum, tahun: tahunSheetIni };
+}
+
+// Cek apakah sebuah sheet termasuk dalam window kontrak tertentu
+function sheetMasukKontrak(sheetBulan, sheetTahun, periode) {
+    if (sheetTahun === periode.tahunMulai && sheetBulan >= BULAN_MULAI_KONTRAK) return true;
+    if (sheetTahun === periode.tahunSelesai && sheetBulan < BULAN_MULAI_KONTRAK) return true;
+    return false;
+}
+
+// Hitung window siklus kontrak yang sedang berjalan, relatif ke bulan/tahun sheet aktif
+function getPeriodeKontrak(bulanAktifNum, tahunAktif) {
+    const tahunMulai = bulanAktifNum >= BULAN_MULAI_KONTRAK ? tahunAktif : tahunAktif - 1;
+    const tahunSelesai = tahunMulai + 1;
+    const bulanKe = bulanAktifNum >= BULAN_MULAI_KONTRAK
+        ? (bulanAktifNum - BULAN_MULAI_KONTRAK + 1)
+        : (bulanAktifNum + (12 - BULAN_MULAI_KONTRAK) + 1);
+    return {
+        tahunMulai, tahunSelesai, bulanKe,
+        label: `${NAMA_BULAN_ID[BULAN_MULAI_KONTRAK]} ${tahunMulai} – ${NAMA_BULAN_ID[BULAN_MULAI_KONTRAK - 1] || "September"} ${tahunSelesai}`
+    };
+}
 
 // ============================================================================
-// 3. FUNGSI BANTUAN & FORMATTING (STRICT)
+// 3. FUNGSI BANTUAN & FORMATTING
 // ============================================================================
 function formatTanggalExcel(val) {
     if (!val) return "-";
@@ -106,11 +148,10 @@ function tentukanKategori(namaAlat) {
     return "📦 LAINNYA";
 }
 
-
 // ============================================================================
-// 4. ENGINE PARSING GOOGLE SHEETS
+// 4. ENGINE PARSING GOOGLE SHEETS JADWAL
 // ============================================================================
-async function getJadwalDariExcel(targetDateObj = new Date()) {
+async function getJadwalDariExcel(targetDateObj) {
     const authClient = await authorize();
     if (!authClient) return null;
     const drive = google.drive({ version: "v3", auth: authClient });
@@ -122,16 +163,22 @@ async function getJadwalDariExcel(targetDateObj = new Date()) {
         const targetSheetName = `${namaBulan[targetDateObj.getMonth()]} ${targetDateObj.getFullYear()}`;
         
         const worksheet = workbook.Sheets[targetSheetName];
-        if (!worksheet) {
-            sendSystemAlert(`⚠️ Tab *${targetSheetName}* tidak ditemukan di Google Sheets.`);
-            return null;
-        }
+        if (!worksheet) return null;
 
-        return XLSX.utils.sheet_to_json(worksheet, { header: 1 }); // Selalu kembalikan Raw Data untuk di-Cache
+        return XLSX.utils.sheet_to_json(worksheet, { header: 1 });
     } catch (error) {
-        sendSystemAlert(`🚨 Error API Google Drive: ${error.message}`);
         return null;
     }
+}
+
+async function getJadwalMultiBulan() {
+    const dateIni = new Date();
+    const dateDepan = new Date();
+    dateDepan.setMonth(dateDepan.getMonth() + 1);
+    
+    const dataIni = await getJadwalDariExcel(dateIni) || [];
+    const dataDepan = await getJadwalDariExcel(dateDepan) || [];
+    return [...dataIni, ...dataDepan];
 }
 
 function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
@@ -140,7 +187,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
     let blocks = [];
     let currentBlock = [];
 
-    // Kelompokkan baris berdasarkan blok tanggal
     for (let i = 0; i < rawData.length; i++) {
         const row = rawData[i];
         const colA = row && row[0] ? row[0].toString().trim() : "";
@@ -155,7 +201,6 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
 
     for (const block of blocks) {
         const masterTanggal = block[0][0].toString().trim();
-        // Filter Tanggal
         if (tanggalAngka !== "" && masterTanggal !== tanggalAngka) continue;
 
         for (let c = 2; c < 50; c += 8) {
@@ -173,6 +218,16 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
             const dateEventRaw = getVal(1, c + 6);
             const dateEvent = formatTanggalExcel(dateEventRaw);
             const loadingDate = getVal(4, c + 6) || "-";
+
+            if (keywordCari !== "" && tanggalAngka === "" && keywordCari !== "[SHOW_ALL]") {
+                if (!isNaN(dateEventRaw)) {
+                    const eventDate = new Date(Math.round((dateEventRaw - 25569) * 86400 * 1000));
+                    eventDate.setHours(0,0,0,0);
+                    const today = new Date();
+                    today.setHours(0,0,0,0);
+                    if (eventDate < today) continue; 
+                }
+            }
 
             let crewList = [];
             let kategoriAlat = {
@@ -230,11 +285,8 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
             }
             msg = msg.trim() + `\n━━━━━━━━━━━━━━━━━━━━`;
 
-            // Filter Pencarian Lanjutan (Smart Search)
-            if (keywordCari !== "") {
-                if (!msg.toLowerCase().includes(keywordCari.toLowerCase())) {
-                    continue; // Jika tidak mengandung keyword pencarian, lewati event ini
-                }
+            if (keywordCari !== "" && keywordCari !== "[SHOW_ALL]") {
+                if (!msg.toLowerCase().includes(keywordCari.toLowerCase())) continue;
             }
 
             daftarPesanWA.push(msg);
@@ -243,7 +295,546 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
     return daftarPesanWA;
 }
 
-function ekstrakStateEvent(rawData) { /* Sama persis, dirangkum untuk efisiensi baris */
+
+// ============================================================================
+// ENGINE FINANCIAL SUITE — DETAIL LENGKAP + PERIODE KONTRAK
+// ============================================================================
+async function parserEngineSlipGaji(namaTarget, queryBulan = null) {
+    const authClient = await authorize();
+    if (!authClient) return "❌ Sistem gagal mengakses akun Google.";
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
+
+    try {
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID_GAJI });
+        const allSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+        const namaBulan = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"];
+        const dateObj = new Date();
+        const blnSekarang = namaBulan[dateObj.getMonth()];
+        const thnSekarang = dateObj.getFullYear().toString();
+
+        let sheetAktif = allSheets[allSheets.length - 1];
+        if (queryBulan) {
+            let found = allSheets.find(s => s.toUpperCase().includes(queryBulan.toUpperCase()));
+            if (found) sheetAktif = found;
+            else return `ℹ️ Arsip bulan *${queryBulan.toUpperCase()}* tidak ditemukan di Google Sheets.`;
+        } else {
+            for (let s of allSheets) {
+                if (s.toUpperCase().includes(blnSekarang) && s.includes(thnSekarang)) {
+                    sheetAktif = s;
+                    break;
+                }
+            }
+        }
+
+        // Tentukan window siklus kontrak berdasarkan sheet yang aktif ditampilkan
+        const { bulanNum: bulanAktifNum, tahun: tahunAktif } = parseSheetBulanTahun(sheetAktif);
+        const periode = getPeriodeKontrak(bulanAktifNum, tahunAktif);
+
+        const batchResponse = await sheets.spreadsheets.values.batchGet({
+            spreadsheetId: SPREADSHEET_ID_GAJI,
+            ranges: allSheets,
+        });
+
+        const allData = batchResponse.data.valueRanges;
+        let totalGajiKontrak = 0;
+        let totalTabunganKontrak = 0;
+        let bulanTerhitungKontrak = 0;
+        let dataBulanIni = null;
+
+        allData.forEach((sheetData, index) => {
+             const sheetName = allSheets[index];
+             const rawData = sheetData.values;
+             if (!rawData) return;
+
+             const { bulanNum: sheetBulanNum, tahun: sheetTahun } = parseSheetBulanTahun(sheetName);
+             const masukKontrakBerjalan = sheetMasukKontrak(sheetBulanNum, sheetTahun, periode);
+
+             let tCol = -1;
+             for (let r = 0; r < Math.min(5, rawData.length); r++) {
+                 if (rawData[r]) {
+                     for (let c = 0; c < rawData[r].length; c++) {
+                         if (rawData[r][c] && rawData[r][c].toString().toUpperCase() === namaTarget.toUpperCase()) {
+                             tCol = c; break;
+                         }
+                     }
+                 }
+                 if (tCol !== -1) break;
+             }
+             if (tCol === -1) tCol = 2;
+
+             let sumBulan = 0, tabunganBulan = 0;
+             for (let i = 0; i < rawData.length; i++) {
+                 const row = rawData[i];
+                 if (!row) continue;
+                 const c1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
+                 const vTarget = row[tCol];
+                 let nilai = 0;
+
+                 if (vTarget !== undefined && vTarget !== null && vTarget !== "") {
+                     let valStr = vTarget.toString().replace(/\./g, '').replace(/,/g, '').replace(/[^\d-]/g, '');
+                     if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
+                 }
+
+                 if (c1 === "SUMMARY") sumBulan = nilai;
+                 if (c1 === "TABUNGAN" && (!row[0] || row[0].toString().trim() === "")) tabunganBulan = nilai;
+             }
+
+             // Hanya akumulasi kalau sheet ini termasuk siklus kontrak yang sedang berjalan
+             if (sumBulan > 0 && masukKontrakBerjalan) {
+                 totalGajiKontrak += sumBulan;
+                 totalTabunganKontrak += tabunganBulan;
+                 bulanTerhitungKontrak++;
+             }
+
+             if (sheetName === sheetAktif) dataBulanIni = rawData;
+        });
+
+        if (!dataBulanIni) return `ℹ️ Data slip gaji untuk ${sheetAktif} belum tersedia.`;
+
+        const rataRataGaji = bulanTerhitungKontrak > 0 ? totalGajiKontrak / bulanTerhitungKontrak : 0;
+
+        let targetColIndex = -1;
+        for (let r = 0; r < Math.min(5, dataBulanIni.length); r++) {
+            if (dataBulanIni[r]) {
+                for (let c = 0; c < dataBulanIni[r].length; c++) {
+                    if (dataBulanIni[r][c] && dataBulanIni[r][c].toString().toUpperCase() === namaTarget.toUpperCase()) {
+                        targetColIndex = c; break;
+                    }
+                }
+            }
+            if (targetColIndex !== -1) break;
+        }
+        if (targetColIndex === -1) {
+            return `⚠️ Nama "${namaTarget}" tidak ditemukan di header sheet ${sheetAktif}. Cek penulisan nama.`;
+        }
+
+        let mode = 0;
+        let dataPeriode1 = [];
+        let dataPeriode2 = [];
+        let vars = {
+            totalFee1: 0, kasbon1: 0, transfer1: 0,
+            totalFee2: 0, kasbon2: 0, liburLebih2: 0, sisaLibur2: 0, thr2: 0,
+            gajiPokok: 0, grandTotal: 0,
+            potongTabungan: 0, transfer2: 0, summaryBulan: 0,
+        };
+
+        for (let i = 0; i < dataBulanIni.length; i++) {
+            const row = dataBulanIni[i];
+            if (!row) continue;
+            const col0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+            const col1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
+            const valTarget = row[targetColIndex];
+
+            let nilai = 0;
+            if (valTarget !== undefined && valTarget !== null && valTarget !== "") {
+                let valStr = valTarget.toString().replace(/\./g, '').replace(/,/g, '').replace(/[^\d-]/g, '');
+                if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
+            }
+
+            if (col0.includes("RECAP FEE TGL 1 -")) { mode = 1; continue; }
+            if (col0.includes("RECAP FEE TGL 16") || col0.includes("RECAP FEE TGL 15")) { mode = 2; continue; }
+
+            if (mode === 1) {
+                if (col1 === "TOTAL FEE") vars.totalFee1 = nilai;
+                if (col1 === "POTONGAN KASBON") vars.kasbon1 = nilai;
+                if (col1 === "TOTAL TRANSFER") vars.transfer1 = nilai;
+                if (col0 !== "" && col0 !== "TGL" && col1 !== "" && col1 !== "VENUE" && col1 !== "TOTAL FEE" && col1 !== "TOTAL TRANSFER" && nilai > 0) {
+                    dataPeriode1.push({ tgl: col0, venue: col1, fee: nilai });
+                }
+            }
+
+            if (mode === 2) {
+                if (col1 === "TOTAL FEE") vars.totalFee2 = nilai;
+                if (col1 === "POTONGAN KASBON") vars.kasbon2 = nilai;
+                if (col1 === "LIBUR LEBIH") vars.liburLebih2 = nilai;
+                if (col1 === "SISA LIBUR") vars.sisaLibur2 = nilai;
+                if (col1 === "THR") vars.thr2 = nilai;
+                if (col1 === "GAJI POKOK") vars.gajiPokok = nilai;
+                if (col1 === "GRAND TOTAL") vars.grandTotal = nilai;
+                if (col1 === "TABUNGAN" && col0 === "") vars.potongTabungan = nilai;
+                if (col1 === "TOTAL TRANSFER") vars.transfer2 = nilai;
+                if (col1 === "SUMMARY") vars.summaryBulan = nilai;
+
+                if (col0 !== "" && col0 !== "TGL" && col0 !== "TABUNGAN" && !col0.includes("BULAN") && col1 !== "" && col1 !== "VENUE" && !col1.includes("TOTAL") && !col1.includes("SUMMARY") && !col1.includes("POTONGAN") && !col1.includes("GAJI") && !col1.includes("GRAND") && col1 !== "TABUNGAN" && nilai > 0) {
+                    dataPeriode2.push({ tgl: col0, venue: col1, fee: nilai });
+                }
+            }
+        }
+
+        const sortDateKey = (tglStr) => {
+            let clean = tglStr.split('-')[0].trim();
+            let num = parseInt(clean);
+            return isNaN(num) ? 99 : num;
+        };
+        dataPeriode1.sort((a, b) => sortDateKey(a.tgl) - sortDateKey(b.tgl));
+        dataPeriode2.sort((a, b) => sortDateKey(a.tgl) - sortDateKey(b.tgl));
+
+        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+
+        const totalFeeJobGabungan = vars.totalFee1 + vars.totalFee2;
+        const totalKasbonGabungan = vars.kasbon1 + vars.kasbon2;
+        const totalGajiBulanIni = vars.summaryBulan > 0 ? vars.summaryBulan : (vars.transfer1 + vars.transfer2);
+
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n💰 *SLIP GAJI: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `👤 *NAMA:* ${namaTarget}\n`;
+        msg += `📆 *Periode Kontrak:* ${periode.label}\n`;
+        msg += `🔢 *Bulan ke:* ${periode.bulanKe} dari 12\n\n`;
+
+        // 1. RINCIAN JOB
+        msg += `📋 *RINCIAN JOB*\n`;
+        msg += `_Tgl 1-15:_\n`;
+        msg += dataPeriode1.length === 0
+            ? `_(Tidak ada job)_\n`
+            : dataPeriode1.map(j => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
+        msg += `\n_Tgl 16-akhir bulan:_\n`;
+        msg += dataPeriode2.length === 0
+            ? `_(Tidak ada job)_\n`
+            : dataPeriode2.map(j => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
+        msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        // 2. RINGKASAN GAJI — semua komponen ditampilkan detail
+        msg += `📊 *RINGKASAN GAJI BULAN INI*\n`;
+        msg += `Total Fee Job (Periode 1+2): ${rp(totalFeeJobGabungan)}\n`;
+        msg += totalKasbonGabungan > 0
+            ? `Potongan Kasbon: -${rp(totalKasbonGabungan)}\n`
+            : `Potongan Kasbon: -\n`;
+        msg += vars.liburLebih2 > 0
+            ? `Potongan Libur Lebih: -${rp(vars.liburLebih2)}\n`
+            : `Potongan Libur Lebih: -\n`;
+        msg += vars.sisaLibur2 > 0
+            ? `Sisa Libur: +${rp(vars.sisaLibur2)}\n`
+            : `Sisa Libur: -\n`;
+        msg += vars.thr2 > 0
+            ? `THR: +${rp(vars.thr2)}\n`
+            : `THR: -\n`;
+        msg += `Gaji Pokok: +${rp(vars.gajiPokok)}\n`;
+        msg += `— — — — — — — —\n`;
+        msg += `*Subtotal (Grand Total):* ${rp(vars.grandTotal)}\n`;
+        msg += vars.potongTabungan > 0
+            ? `Potong Tabungan: -${rp(vars.potongTabungan)}\n`
+            : `Potong Tabungan: -\n`;
+        msg += `— — — — — — — —\n`;
+        msg += `*💵 TOTAL DITERIMA BULAN INI: ${rp(totalGajiBulanIni)}*\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        // 3. JADWAL PENCAIRAN
+        msg += `💸 *JADWAL PENCAIRAN*\n`;
+        msg += `• Cair Tgl 1-15: ${rp(vars.transfer1)}\n`;
+        msg += `• Cair Tgl 16-akhir: ${rp(vars.transfer2)}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        // 4. INFO KONTRAK & TABUNGAN (dihitung per siklus kontrak, bukan tahun kalender)
+        msg += `📈 *RINGKASAN SIKLUS KONTRAK (${periode.label})*\n`;
+        msg += `• Bulan Tercatat: ${bulanTerhitungKontrak} dari ${periode.bulanKe} bulan berjalan\n`;
+        msg += `• Rata-rata Gaji/Bulan: ${rp(Math.round(rataRataGaji))}\n`;
+        msg += `• Akumulasi Tabungan: *${rp(totalTabunganKontrak)}*\n`;
+        msg += `\n━━━━━━━━━━━━━━━━━━━━`;
+
+        return msg;
+    } catch (error) {
+        console.error("Error Slip Gaji:", error);
+        return `🚨 Error API Slip Gaji: ${error.message}`;
+    }
+}
+
+async function getRekapTahunan(namaTarget) {
+    const authClient = await authorize();
+    if (!authClient) return "❌ Sistem gagal mengakses akun Google.";
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
+
+    try {
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID_GAJI });
+        const allSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+        const thnSekarang = new Date().getFullYear().toString();
+
+        const batchResponse = await sheets.spreadsheets.values.batchGet({
+            spreadsheetId: SPREADSHEET_ID_GAJI,
+            ranges: allSheets,
+        });
+
+        const allData = batchResponse.data.valueRanges;
+        let totalGajiTahunIni = 0;
+        let totalTabunganTahunIni = 0;
+        let bulanTerhitung = 0;
+        let rincianPerBulan = [];
+
+        allData.forEach((sheetData, index) => {
+            const sheetName = allSheets[index];
+            const rawData = sheetData.values;
+            if (!rawData) return;
+
+            let tCol = 2;
+            for (let r = 0; r < Math.min(5, rawData.length); r++) {
+                if (rawData[r]) {
+                    for (let c = 0; c < rawData[r].length; c++) {
+                        if (rawData[r][c] && rawData[r][c].toString().toUpperCase() === namaTarget.toUpperCase()) {
+                            tCol = c; break;
+                        }
+                    }
+                }
+                if (tCol !== 2) break;
+            }
+
+            let trans1 = 0, trans2 = 0, tabunganBulan = 0;
+            let m = 0;
+
+            for (let i = 0; i < rawData.length; i++) {
+                const row = rawData[i];
+                if (!row) continue;
+                const c0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+                const c1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
+                const vTarget = row[tCol];
+                let nilai = 0;
+
+                if (vTarget !== undefined && vTarget !== null && vTarget !== "") {
+                    let valStr = vTarget.toString().replace(/\./g, '').replace(/,/g, '').replace(/[^\d-]/g, '');
+                    if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
+                }
+
+                if (c0.includes("TGL 1 -")) m = 1;
+                else if (c0.includes("TGL 15") || c0.includes("TGL 16")) m = 2;
+
+                if (c1 === "TOTAL TRANSFER") {
+                    if (m === 1) trans1 = nilai;
+                    else if (m === 2) trans2 = nilai;
+                }
+                if (c1 === "TABUNGAN" && c0 === "") tabunganBulan = nilai;
+            }
+
+            let totalBulan = trans1 + trans2;
+            if (totalBulan > 0) {
+                totalGajiTahunIni += totalBulan;
+                totalTabunganTahunIni += tabunganBulan;
+                bulanTerhitung++;
+                rincianPerBulan.push({ bulan: sheetName, total: totalBulan });
+            }
+        });
+
+        const rataRataGaji = bulanTerhitung > 0 ? totalGajiTahunIni / bulanTerhitung : 0;
+        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n📈 *REKAP TAHUNAN (${thnSekarang})*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `👤 *NAMA:* ${namaTarget}\n`;
+        msg += `⏱️ *Periode Tercatat:* ${bulanTerhitung} Bulan\n\n`;
+        msg += `*📊 RINGKASAN UTAMA:*\n`;
+        msg += `• Total Pendapatan (YTD): *${rp(totalGajiTahunIni)}*\n`;
+        msg += `• Rata-rata Gaji/Bulan: *${rp(Math.round(rataRataGaji))}*\n`;
+        msg += `• Total Akumulasi Tabungan: *${rp(totalTabunganTahunIni)}*\n\n`;
+        msg += `*📅 RINCIAN PER BULAN:*\n`;
+        rincianPerBulan.forEach(item => { msg += `• ${item.bulan}: ${rp(item.total)}\n`; });
+        msg += `\n━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return `🚨 Error Rekap Tahunan: ${error.message}`;
+    }
+}
+
+async function getTopVenue(namaTarget) {
+    const authClient = await authorize();
+    if (!authClient) return "❌ Sistem gagal mengakses akun Google.";
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
+
+    try {
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID_GAJI });
+        const allSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+        const batchResponse = await sheets.spreadsheets.values.batchGet({
+            spreadsheetId: SPREADSHEET_ID_GAJI,
+            ranges: allSheets,
+        });
+
+        const allData = batchResponse.data.valueRanges;
+        let venueMap = {};
+
+        allData.forEach((sheetData) => {
+            const rawData = sheetData.values;
+            if (!rawData) return;
+
+            let tCol = 2;
+            for (let r = 0; r < Math.min(5, rawData.length); r++) {
+                if (rawData[r]) {
+                    for (let c = 0; c < rawData[r].length; c++) {
+                        if (rawData[r][c] && rawData[r][c].toString().toUpperCase() === namaTarget.toUpperCase()) {
+                            tCol = c; break;
+                        }
+                    }
+                }
+                if (tCol !== 2) break;
+            }
+
+            for (let i = 0; i < rawData.length; i++) {
+                const row = rawData[i];
+                if (!row) continue;
+                const col0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+                const col1 = row[1] ? row[1].toString().trim() : "";
+                const valTarget = row[tCol];
+
+                let nilai = 0;
+                if (valTarget !== undefined && valTarget !== null && valTarget !== "") {
+                    let valStr = valTarget.toString().replace(/\./g, '').replace(/,/g, '').replace(/[^\d-]/g, '');
+                    if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
+                }
+
+                if (col0 !== "" && col0 !== "TGL" && col0 !== "TABUNGAN" && !col0.includes("BULAN") && col1 !== "" && col1.toUpperCase() !== "VENUE" && !col1.toUpperCase().includes("TOTAL") && !col1.toUpperCase().includes("SUMMARY")) {
+                    if (nilai > 0) {
+                        let venueName = col1;
+                        if (!venueMap[venueName]) venueMap[venueName] = { count: 0, totalFee: 0 };
+                        venueMap[venueName].count += 1;
+                        venueMap[venueName].totalFee += nilai;
+                    }
+                }
+            }
+        });
+
+        let sortedVenues = Object.keys(venueMap).map(v => ({
+            name: v,
+            count: venueMap[v].count,
+            totalFee: venueMap[v].totalFee
+        })).sort((a, b) => b.totalFee - a.totalFee).slice(0, 5);
+
+        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n🏆 *TOP 5 VENUE / KLIEN TERBESAR*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `👤 *NAMA:* ${namaTarget}\n\n`;
+
+        sortedVenues.forEach((v, idx) => {
+            msg += `${idx + 1}. *${v.name}*\n`;
+            msg += `   • Total Fee: ${rp(v.totalFee)}\n`;
+            msg += `   • Frekuensi: ${v.count} Event\n\n`;
+        });
+        msg += `━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return `🚨 Error Top Venue: ${error.message}`;
+    }
+}
+
+async function getProyeksiTabungan(namaTarget) {
+    const authClient = await authorize();
+    if (!authClient) return "❌ Sistem gagal mengakses akun Google.";
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
+
+    try {
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID_GAJI });
+        const allSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+        const batchResponse = await sheets.spreadsheets.values.batchGet({
+            spreadsheetId: SPREADSHEET_ID_GAJI,
+            ranges: allSheets,
+        });
+
+        const allData = batchResponse.data.valueRanges;
+        let totalTabunganSekarang = 0;
+        let bulanAktifCount = 0;
+
+        allData.forEach((sheetData) => {
+            const rawData = sheetData.values;
+            if (!rawData) return;
+            let tCol = 2;
+            for (let r = 0; r < Math.min(5, rawData.length); r++) {
+                if (rawData[r]) {
+                    for (let c = 0; c < rawData[r].length; c++) {
+                        if (rawData[r][c] && rawData[r][c].toString().toUpperCase() === namaTarget.toUpperCase()) {
+                            tCol = c; break;
+                        }
+                    }
+                }
+                if (tCol !== 2) break;
+            }
+
+            let tabunganBulan = 0;
+            let adaGaji = false;
+            for (let i = 0; i < rawData.length; i++) {
+                const row = rawData[i];
+                if (!row) continue;
+                const c0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+                const c1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
+                const vTarget = row[tCol];
+                let nilai = 0;
+
+                if (vTarget !== undefined && vTarget !== null && vTarget !== "") {
+                    let valStr = vTarget.toString().replace(/\./g, '').replace(/,/g, '').replace(/[^\d-]/g, '');
+                    if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
+                }
+
+                if (c1 === "TOTAL TRANSFER" && nilai > 0) adaGaji = true;
+                if (c1 === "TABUNGAN" && c0 === "") tabunganBulan = nilai;
+            }
+            if (adaGaji) {
+                totalTabunganSekarang += tabunganBulan;
+                bulanAktifCount++;
+            }
+        });
+
+        // Proyeksi sisa bulan sampai Desember
+        let sisaBulan = Math.max(0, 12 - bulanAktifCount);
+        let estimasiRataTabunganBulan = bulanAktifCount > 0 ? (totalTabunganSekarang / bulanAktifCount) : 300000;
+        let proyeksiTambahan = sisaBulan * estimasiRataTabunganBulan;
+        let prediksiAkhirTahun = totalTabunganSekarang + proyeksiTambahan;
+
+        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n🐷 *PROYEKSI TABUNGAN TAHUNAN*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `👤 *NAMA:* ${namaTarget}\n\n`;
+        msg += `• Saldo Tabungan Saat Ini: *${rp(totalTabunganSekarang)}*\n`;
+        msg += `• Bulan Tercatat: ${bulanAktifCount} Bulan\n`;
+        msg += `• Estimasi Sisa Tahun Ini: ${sisaBulan} Bulan\n\n`;
+        msg += `🚀 *PREDIKSI SALDO AKHIR DESEMBER:*\n`;
+        msg += `👉 *${rp(prediksiAkhirTahun)}*\n\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return `🚨 Error Proyeksi Tabungan: ${error.message}`;
+    }
+}
+
+// ============================================================================
+// 6. ENGINE WHATSAPP & BOT LOGIC
+// ============================================================================
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] },
+});
+
+const sendSystemAlert = async (text) => {
+    console.log(text);
+    if (isBotReady) {
+        try { await client.sendMessage(ID_TUJUAN_NOTIFIKASI, text); } catch (e) {}
+    }
+};
+
+const simulateTyping = async (chat, text) => {
+    if (!chat) return;
+    try {
+        await chat.sendSeen();
+        await chat.sendStateTyping();
+        let typingTime = Math.min(text.length * 30 + 500, 2000);
+        await new Promise((resolve) => setTimeout(resolve, typingTime));
+        await chat.clearState();
+    } catch (error) {}
+};
+
+const jalankanRonda = async () => {
+    console.log("🕵️ Meronda 2 Bulan Sekaligus...");
+    try {
+        const dataTerbaru = await getJadwalMultiBulan();
+        if (!dataTerbaru || dataTerbaru.length === 0) return;
+
+        if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
+            console.log("🔔 Ada perubahan jadwal!");
+            const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
+            if (daftarRevisi.length > 0) {
+                let teksDaftar = daftarRevisi.map((item) => `• *${item}*`).join("\n");
+                const pesanNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nAdmin baru saja mengubah data pada event:\n${teksDaftar}\n\n💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
+                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
+            }
+        }
+        objekDataLama = dataTerbaru;
+    } catch (err) {
+        sendSystemAlert(`❌ Sistem Ronda Gagal: ${err.message}`);
+    }
+};
+
+function ekstrakStateEvent(rawData) {
     let state = {};
     if (!rawData || !Array.isArray(rawData)) return state;
     let blocks = [];
@@ -267,9 +858,11 @@ function ekstrakStateEvent(rawData) { /* Sama persis, dirangkum untuk efisiensi 
             let eventTitle = cleanStr(getVal(2, c + 6));
             const venue = cleanStr(getVal(3, c + 6));
             if (!picName && !companyName && !eventTitle && !venue) continue;
+            
             let namaTampil = eventTitle || venue || companyName || picName || "Event Tanpa Nama";
             let dateStr = formatTanggalExcel(getVal(1, c + 6));
             let eventKey = `${dateStr}_${c}_${namaTampil}`;
+            
             let crewList = [];
             let statusEvent = "";
             let isiEventLengkap = [];
@@ -277,6 +870,7 @@ function ekstrakStateEvent(rawData) { /* Sama persis, dirangkum untuk efisiensi 
                 let barisString = "";
                 for (let k = c; k <= c + 7; k++) barisString += getVal(i, k) + "|";
                 isiEventLengkap.push(barisString);
+                
                 if (i >= 8) {
                     let teksBaris = barisString.toUpperCase();
                     if (teksBaris.includes("CUSTOMER DETILS|")) break;
@@ -317,84 +911,24 @@ function cariPerubahanEvent(dataLama, dataBaru) {
     return hasilPerubahan;
 }
 
-
-// ============================================================================
-// 5. ENGINE WHATSAPP & BOT LOGIC
-// ============================================================================
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] },
-});
-
-// Fitur: Alerting System (Health Check)
-const sendSystemAlert = async (text) => {
-    console.log(text);
-    if (isBotReady) {
-        try {
-            await client.sendMessage(ID_TUJUAN_NOTIFIKASI, text);
-        } catch (e) {}
-    }
-};
-
-const simulateTyping = async (chat, text) => {
-    try {
-        await chat.sendSeen();
-        await chat.sendStateTyping();
-        let typingTime = Math.min(text.length * 30 + 500, 2000);
-        await new Promise((resolve) => setTimeout(resolve, typingTime));
-        await chat.clearState();
-    } catch (error) {}
-};
-
-// Fitur Patroli
-const jalankanRonda = async () => {
-    console.log("🕵️ Meronda...");
-    try {
-        const dataTerbaru = await getJadwalDariExcel(new Date());
-        if (!dataTerbaru) return; // Jika gagal narik excel, stop ronde ini
-
-        if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
-            console.log("🔔 Ada perubahan jadwal!");
-            const daftarRevisi = cariPerubahanEvent(objekDataLama, dataTerbaru);
-            if (daftarRevisi.length > 0) {
-                let teksDaftar = daftarRevisi.map((item) => `• *${item}*`).join("\n");
-                const pesanNotif = `🚨 *ALARM REVISI ADMIN* 🚨\n\nAdmin baru saja mengubah data pada event:\n${teksDaftar}\n\n💡 _Ketik *1* atau *2* untuk melihat detail peralatan terbaru._`;
-                await client.sendMessage(ID_TUJUAN_NOTIFIKASI, pesanNotif);
-            }
-        }
-        objekDataLama = dataTerbaru; // Update Cache Global
-    } catch (err) {
-        sendSystemAlert(`❌ Sistem Ronda Gagal: ${err.message}`);
-    }
-};
-
-// --- WHATSAPP EVENT LISTENERS ---
 client.on("qr", (qr) => qrcode.generate(qr, { small: true }));
 
 client.on("ready", async () => {
     console.log("✅ Bot Siap!");
     isBotReady = true;
 
-    // Tarik data pertama kali agar In-Memory Cache terisi
-    objekDataLama = await getJadwalDariExcel(new Date());
-
-    // 1. Patroli data tiap menit
+    objekDataLama = await getJadwalMultiBulan();
     setInterval(jalankanRonda, WAKTU_RONDA_MS);
 
-    // 2. Fitur Enterprise: Daily Morning Briefing
-    // Terjadwal jalan setiap jam 06:00 pagi setiap hari ('0 6 * * *')
     cron.schedule('0 6 * * *', async () => {
         try {
             const dateObj = new Date();
             const tglHariIni = dateObj.getDate().toString();
-            
-            // Ambil fresh data khusus pagi hari
-            const freshData = await getJadwalDariExcel(dateObj); 
-            if(freshData) objekDataLama = freshData;
+            const freshData = await getJadwalMultiBulan(); 
+            if (freshData) objekDataLama = freshData;
 
             const daftarPesan = prosesDataKePesanWA(objekDataLama, tglHariIni, "");
-            
-            let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi, Bli Ari! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
+            let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
             await client.sendMessage(ID_TUJUAN_NOTIFIKASI, sapaanPagi);
 
             for (const pesan of daftarPesan) {
@@ -404,7 +938,7 @@ client.on("ready", async () => {
         } catch (error) {
             sendSystemAlert(`❌ Gagal mengirim Morning Briefing: ${error.message}`);
         }
-    });
+    }, { scheduled: true, timezone: "Asia/Makassar" });
 
     sendSystemAlert("✅ AGS Bot Enterprise System Online!");
 });
@@ -419,46 +953,94 @@ process.on("unhandledRejection", (error) => {
 });
 
 client.on("message", async (msg) => {
-    if (msg.from !== ID_TUJUAN_NOTIFIKASI) return;
+    const ALLOWED_ADMINS = ["628970282769", "35270472773718"];
+    const contact = await msg.getContact();
+    const nomorPengirim = contact.number; 
+
+    if (!nomorPengirim || !ALLOWED_ADMINS.includes(nomorPengirim)) return;
 
     const text = msg.body.toLowerCase().trim();
-    const chat = await msg.getChat();
+    
+    let chat = null;
+    try { chat = await msg.getChat(); } catch (error) {}
 
-    // Menu Utama
+    const balasPesan = async (teksBalasan) => {
+        if (chat) await simulateTyping(chat, teksBalasan);
+        try { await msg.reply(teksBalasan); } 
+        catch (err) { await client.sendMessage(ID_TUJUAN_NOTIFIKASI, teksBalasan); }
+    };
+
     if (["halo", "menu", "jadwal", "bot"].includes(text)) {
-        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Bulan Ini\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n_Contoh: cari Bli Ari_\n_Contoh: cari BCA_\n\n✏️ Ketik pilihan Anda...`;
-        await simulateTyping(chat, balasanMenu);
-        await msg.reply(balasanMenu);
+        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Mendatang\n\n💰 *Keuangan & Slip Gaji:*\n• \`gaji\` (Bulan Berjalan)\n• \`gaji [bulan]\` (Contoh: \`gaji mei\`)\n• \`rekap tahun\` (Ringkasan Tahunan)\n• \`top venue\` (Peringkat Klien Terbesar)\n• \`proyeksi tabungan\` (Estimasi Saldo)\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n\n✏️ Ketik pilihan Anda...`;
+        await balasPesan(balasanMenu);
     } 
     
-    // Fitur Enterprise: Advanced Query (Pencarian Cerdas)
+    else if (text === "gaji" || text === "slip gaji") {
+        await balasPesan(`⏳ Mengakses brankas data slip gaji bulan ini...`);
+        const hasilGaji = await parserEngineSlipGaji(NAMA_SAYA_DI_ABSEN, null); 
+        await balasPesan(hasilGaji);
+    }
+
+    else if (text.startsWith("gaji ")) {
+        let bulanQuery = text.replace("gaji ", "").trim();
+        await balasPesan(`⏳ Membuka arsip slip gaji bulan *${bulanQuery.toUpperCase()}*...`);
+        const hasilArsip = await parserEngineSlipGaji(NAMA_SAYA_DI_ABSEN, bulanQuery);
+        await balasPesan(hasilArsip);
+    }
+
+    else if (text === "rekap tahun" || text === "rekap tahunan") {
+        await balasPesan(`⏳ Menghitung rekapitulasi finansial tahunan...`);
+        const hasilRekap = await getRekapTahunan(NAMA_SAYA_DI_ABSEN);
+        await balasPesan(hasilRekap);
+    }
+
+    else if (text === "top venue" || text === "venue termahal") {
+        await balasPesan(`⏳ Menganalisis venue dan klien penghasilan terbesar...`);
+        const hasilTop = await getTopVenue(NAMA_SAYA_DI_ABSEN);
+        await balasPesan(hasilTop);
+    }
+
+    else if (text === "proyeksi tabungan") {
+        await balasPesan(`⏳ Menghitung proyeksi saldo tabungan akhir tahun...`);
+        const hasilProyeksi = await getProyeksiTabungan(NAMA_SAYA_DI_ABSEN);
+        await balasPesan(hasilProyeksi);
+    }
+
     else if (text.startsWith("cari ") || text.startsWith("search ")) {
-        const keyword = text.replace("cari ", "").replace("search ", "").trim();
-        if (keyword.length < 3) {
-            return msg.reply("⚠️ Kata kunci terlalu pendek. Minimal 3 huruf.");
+        let keyword = text.replace("cari ", "").replace("search ", "").trim();
+        if (keyword.length < 3) return balasPesan("⚠️ Kata kunci terlalu pendek. Minimal 3 huruf.");
+
+        let targetTanggal = "";
+        let infoWaktu = "Mendatang (Disaring Otomatis)";
+
+        if (keyword.endsWith(" hari ini")) {
+            keyword = keyword.replace(" hari ini", "").trim();
+            targetTanggal = new Date().getDate().toString();
+            infoWaktu = "Hari Ini";
+        } else if (keyword.endsWith(" besok")) {
+            keyword = keyword.replace(" besok", "").trim();
+            let besok = new Date(); 
+            besok.setDate(besok.getDate() + 1);
+            targetTanggal = besok.getDate().toString();
+            infoWaktu = "Besok";
         }
 
-        const balasanTunggu = `⏳ Mencari data mengandung kata: *"${keyword}"* ...`;
-        await simulateTyping(chat, balasanTunggu);
-        await msg.reply(balasanTunggu);
+        await balasPesan(`⏳ Mencari *"${keyword}"* untuk jadwal ${infoWaktu}...`);
 
-        // Langsung hajar dari CACHE! Super cepat (0ms)
-        const dataBulanIni = objekDataLama || (await getJadwalDariExcel(new Date()));
-        const daftarPesan = prosesDataKePesanWA(dataBulanIni, "", keyword);
+        const dataCache = objekDataLama || (await getJadwalMultiBulan());
+        const daftarPesan = prosesDataKePesanWA(dataCache, targetTanggal, keyword);
 
         if (daftarPesan.length === 0) {
-            await msg.reply(`ℹ️ Tidak ditemukan event/crew/alat dengan kata kunci *"${keyword}"* bulan ini.`);
+            await balasPesan(`ℹ️ Tidak ditemukan hasil untuk *"${keyword}"* (${infoWaktu}).`);
         } else {
-            await msg.reply(`✅ Ditemukan *${daftarPesan.length} Hasil* pencarian:`);
+            await balasPesan(`✅ Ditemukan *${daftarPesan.length} Hasil* pencarian:`);
             for (const pesan of daftarPesan) {
-                await simulateTyping(chat, pesan);
-                await client.sendMessage(msg.from, pesan);
+                await balasPesan(pesan);
                 await new Promise((res) => setTimeout(res, 500)); 
             }
         }
     }
 
-    // Tarik Data Jadwal (Fitur Enterprise: In-Memory Caching - Kecepatan Kilat)
     else if (["1", "2", "3"].includes(text)) {
         const dateObj = new Date();
         let tglTarget = "";
@@ -473,29 +1055,21 @@ client.on("message", async (msg) => {
             labelTarget = "Besok";
         } else if (text === "3") {
             tglTarget = "";
-            labelTarget = "Semua Jadwal Bulan Ini";
+            labelTarget = "Semua Jadwal Mendatang";
         }
 
-        const balasanTunggu = `⚡ Menarik data ${labelTarget} (Cache Mode)...`;
-        await simulateTyping(chat, balasanTunggu);
-        await msg.reply(balasanTunggu);
+        await balasPesan(`⚡ Menarik data ${labelTarget} (Cache Mode)...`);
 
-        // Jika cache kosong karena sistem baru nyala, fetch baru. Kalau sudah ada, pakai cache!
-        if (!objekDataLama) {
-            objekDataLama = await getJadwalDariExcel(dateObj);
-        }
-        
-        // Proses datanya secara instan dari RAM Server
-        const daftarPesan = prosesDataKePesanWA(objekDataLama, tglTarget, "");
+        if (!objekDataLama) objekDataLama = await getJadwalMultiBulan();
+        const keywordVirtual = text === "3" ? "[SHOW_ALL]" : ""; 
+        const daftarPesan = prosesDataKePesanWA(objekDataLama, tglTarget, keywordVirtual);
 
         if (daftarPesan.length === 0) {
-            const balasanKosong = `ℹ️ Tidak ada jadwal untuk ${labelTarget}.`;
-            await simulateTyping(chat, balasanKosong);
-            await msg.reply(balasanKosong);
+            await balasPesan(`ℹ️ Tidak ada jadwal untuk ${labelTarget}.`);
         } else {
             for (const pesan of daftarPesan) {
-                await simulateTyping(chat, pesan);
-                await client.sendMessage(msg.from, pesan);
+                const pesanBersih = pesan.replace("[SHOW_ALL]", "").trim(); 
+                await balasPesan(pesanBersih);
                 await new Promise((res) => setTimeout(res, 500)); 
             }
         }
