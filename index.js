@@ -146,6 +146,51 @@ function formatTanggalExcel(val) {
     return val.toString().trim();
 }
 
+// Ubah value tanggal (serial Excel ATAU teks bebas kayak "Tgl 16 jam 12 siang") jadi objek Date asli,
+// biar bisa dibandingkan/overlap-check secara kalender, bukan cuma dibandingkan sebagai teks.
+// bulanFallback & tahunFallback dipakai kalau teksnya cuma nyebut angka tanggal doang (misal loading
+// date yang cuma ditulis "Tgl 16" tanpa bulan) - biasanya diisi dari tanggal event di event yang sama.
+const NAMA_BULAN_LOWER = ["januari", "februari", "maret", "april", "mei", "juni", "juli", "agustus", "september", "oktober", "november", "desember"];
+
+function parseTanggalKeDate(val, bulanFallback = null, tahunFallback = null) {
+    if (val === undefined || val === null || val === "" || val === "-") return null;
+
+    // Kasus umum: serial date Excel (angka)
+    if (!isNaN(val) && Number(val) > 40000) {
+        const utc = new Date(Math.round((Number(val) - 25569) * 86400 * 1000));
+        return new Date(utc.getUTCFullYear(), utc.getUTCMonth(), utc.getUTCDate());
+    }
+
+    // Kasus teks bebas: coba tebak tanggal/bulan/tahun dari teksnya
+    const teks = val.toString().trim();
+    const bulanRegex = new RegExp(NAMA_BULAN_LOWER.join("|"), "i");
+    const bulanMatch = teks.match(bulanRegex);
+    const angkaMatch = teks.match(/\d{1,2}/); // angka pertama yang muncul dianggap tanggal
+    if (!angkaMatch) return null;
+
+    const tanggalNum = parseInt(angkaMatch[0]);
+    if (tanggalNum < 1 || tanggalNum > 31) return null;
+
+    const bulanNum = bulanMatch ? NAMA_BULAN_LOWER.indexOf(bulanMatch[0].toLowerCase()) + 1 : bulanFallback;
+    const tahunMatch = teks.match(/\d{4}/);
+    const tahunNum = tahunMatch ? parseInt(tahunMatch[0]) : tahunFallback;
+
+    if (!bulanNum || !tahunNum) return null;
+    return new Date(tahunNum, bulanNum - 1, tanggalNum);
+}
+
+// Filter noise di kolom CREW - kadang admin nulis catatan di kolom ini
+// (misal "Loding tgl 13 Agustus"), bukan nama crew beneran.
+function namaCrewValid(teks) {
+    if (!teks) return false;
+    const upper = teks.toUpperCase();
+    if (upper === "CREW" || upper === "-" || upper === "NTRL") return true; // NTRL = kode internal, tetap dianggap valid
+    if (/\d/.test(teks)) return false; // ada angka -> kemungkinan besar catatan tanggal/jam
+    if (/TGL|LODING|LOADING|\bJAM\b|CATATAN|NOTE/i.test(teks)) return false;
+    if (teks.length > 25) return false; // nama crew biasanya pendek, teks panjang = kemungkinan catatan
+    return true;
+}
+
 function cleanStr(str) {
     if (!str) return "";
     const s = str.toString().trim();
@@ -1013,9 +1058,19 @@ function ekstrakStateEvent(rawData) {
             if (!picName && !companyName && !eventTitle && !venue) continue;
 
             let namaTampil = eventTitle || venue || companyName || picName || "Event Tanpa Nama";
-            let dateStr = formatTanggalExcel(getVal(1, c + 6));
-            let loadingStr = getVal(4, c + 6) || "-";
+            let dateStrRaw = getVal(1, c + 6);
+            let dateStr = formatTanggalExcel(dateStrRaw);
+            let loadingStrRaw = getVal(4, c + 6);
+            let loadingStr = loadingStrRaw || "-";
             let eventKey = `SLOT_${masterTanggal}_${c}`;
+
+            // Objek Date asli buat perbandingan kalender (cek konflik jadwal, cek event lewat/belum)
+            let tanggalObj = parseTanggalKeDate(dateStrRaw);
+            let loadingObj = parseTanggalKeDate(
+                loadingStrRaw,
+                tanggalObj ? tanggalObj.getMonth() + 1 : null,
+                tanggalObj ? tanggalObj.getFullYear() : null
+            ) || tanggalObj; // kalau loading date gak jelas, anggap sama dengan tanggal event
 
             let crewList = [];
             let statusEvent = "";
@@ -1039,7 +1094,9 @@ function ekstrakStateEvent(rawData) {
                     if (crew && crew !== "-" && crew.toUpperCase() !== "CREW" && crew !== "") {
                         if (crew.toUpperCase() === "DONE" || crew.toUpperCase() === "CANCEL" || crew.toUpperCase() === "CANCELLED") {
                             statusEvent = crew;
-                        } else if (!crewList.includes(crew)) crewList.push(crew);
+                        } else if (namaCrewValid(crew) && !crewList.includes(crew)) {
+                            crewList.push(crew);
+                        }
                     }
 
                     // Ambil data barang/alat di baris yang sama, supaya bisa dibandingkan (ditambah/dihapus)
@@ -1058,7 +1115,9 @@ function ekstrakStateEvent(rawData) {
             state[eventKey] = {
                 nama: namaTampil,
                 tanggal: dateStr,
+                tanggalObj: tanggalObj,
                 loading: loadingStr,
+                loadingObj: loadingObj,
                 venue: venue,
                 company: companyName,
                 crew: crewList,
@@ -1160,59 +1219,43 @@ function cariPerubahanEvent(dataLama, dataBaru) {
 // 7. DETEKSI KONFLIK JADWAL (DOUBLE BOOKING) & PENCARIAN CREW/ALAT
 // ============================================================================
 
-// Cek apakah ada crew atau alat yang ke-assign ke lebih dari 1 event di tanggal yang sama.
-// Catatan: pencocokan alat murni berdasarkan nama (tanpa qty), jadi ini bukan cek stok
-// fisik (misal cuma ada 2 unit tapi dipesan 3 event) — cuma flag "dipakai bareng di tanggal sama".
+// Cek apakah ada CREW yang ke-assign ke 2 event yang jadwalnya beririsan (loading s/d acara).
+// Contoh: Event A loading tgl 1, acara tgl 2. Event B loading & acara tgl 2.
+// -> beririsan di tgl 2, kalau crew-nya sama maka ini baru dianggap bentrok.
+// Alat/barang sengaja TIDAK dicek lagi di sini (kebanyakan noise), fokus ke crew saja.
+// Event yang tanggal acaranya sudah lewat hari ini otomatis di-skip (gak relevan lagi).
 function cekKonflikJadwal(rawData) {
     const state = ekstrakStateEvent(rawData);
-    const eventsByDate = {};
+    const hariIni = new Date();
+    hariIni.setHours(0, 0, 0, 0);
 
-    for (const key in state) {
-        const ev = state[key];
-        if (!ev.tanggal || ev.tanggal === "-") continue;
-        if (!eventsByDate[ev.tanggal]) eventsByDate[ev.tanggal] = [];
-        eventsByDate[ev.tanggal].push(ev);
-    }
+    // Ambil event yang tanggalnya bisa ditentukan DAN belum lewat
+    const daftarEvent = Object.values(state).filter((ev) => {
+        if (!ev.tanggalObj) return false; // tanggal gak bisa dibaca -> skip biar gak salah alarm
+        return ev.tanggalObj.getTime() >= hariIni.getTime();
+    });
 
     let daftarKonflik = [];
-    for (const tanggal in eventsByDate) {
-        const events = eventsByDate[tanggal];
-        if (events.length < 2) continue;
+    for (let i = 0; i < daftarEvent.length; i++) {
+        for (let j = i + 1; j < daftarEvent.length; j++) {
+            const a = daftarEvent[i];
+            const b = daftarEvent[j];
 
-        // Cek crew bentrok
-        let crewMap = {};
-        for (const ev of events) {
-            for (const crew of ev.crew) {
-                if (!crewMap[crew]) crewMap[crew] = new Set();
-                crewMap[crew].add(ev.nama);
-            }
-        }
-        for (const crew in crewMap) {
-            const daftarEvent = [...crewMap[crew]];
-            if (daftarEvent.length > 1) {
-                daftarKonflik.push(
-                    `👤 *${crew}* ke-assign di ${daftarEvent.length} event tanggal ${tanggal}:\n` +
-                    daftarEvent.map((n) => `   • ${n}`).join("\n")
-                );
-            }
-        }
+            const mulaiA = a.loadingObj || a.tanggalObj;
+            const selesaiA = a.tanggalObj;
+            const mulaiB = b.loadingObj || b.tanggalObj;
+            const selesaiB = b.tanggalObj;
 
-        // Cek alat bentrok (nama barang tanpa qty di depan)
-        let itemMap = {};
-        for (const ev of events) {
-            for (const item of ev.items) {
-                const namaBarang = item.replace(/^\d+\s*/, "").trim().toUpperCase();
-                if (!namaBarang) continue;
-                if (!itemMap[namaBarang]) itemMap[namaBarang] = new Set();
-                itemMap[namaBarang].add(ev.nama);
-            }
-        }
-        for (const namaBarang in itemMap) {
-            const daftarEvent = [...itemMap[namaBarang]];
-            if (daftarEvent.length > 1) {
+            // Overlap range [mulaiA, selesaiA] vs [mulaiB, selesaiB]
+            const beririsan = mulaiA.getTime() <= selesaiB.getTime() && mulaiB.getTime() <= selesaiA.getTime();
+            if (!beririsan) continue;
+
+            const crewBentrok = a.crew.filter((c) => b.crew.some((c2) => c2.toUpperCase() === c.toUpperCase()));
+            for (const crew of crewBentrok) {
                 daftarKonflik.push(
-                    `📦 *${namaBarang}* dipakai di ${daftarEvent.length} event tanggal ${tanggal}:\n` +
-                    daftarEvent.map((n) => `   • ${n}`).join("\n")
+                    `👤 *${crew}* ke-assign bareng di 2 event yang jadwalnya beririsan:\n` +
+                    `   • ${a.nama} (Loading ${a.loading} ➡️ Acara ${a.tanggal})\n` +
+                    `   • ${b.nama} (Loading ${b.loading} ➡️ Acara ${b.tanggal})`
                 );
             }
         }
@@ -1379,11 +1422,11 @@ client.on("message", async (msg) => {
     }
 
     else if (text === "cek konflik" || text === "konflik jadwal") {
-        await balasPesan(`⏳ Mengecek bentrokan jadwal (crew & alat)...`);
+        await balasPesan(`⏳ Mengecek bentrokan jadwal crew (loading s/d acara)...`);
         const dataCek = objekDataLama || (await getJadwalMultiBulan());
         const hasilKonflik = cekKonflikJadwal(dataCek);
         if (hasilKonflik.length === 0) {
-            await balasPesan(`✅ Tidak ada bentrokan jadwal terdeteksi untuk crew maupun alat.`);
+            await balasPesan(`✅ Tidak ada bentrokan jadwal crew yang terdeteksi (untuk event hari ini & ke depan).`);
         } else {
             await balasPesan(`⚠️ Ditemukan *${hasilKonflik.length} bentrokan*:`);
             for (const k of hasilKonflik) {
