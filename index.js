@@ -963,7 +963,11 @@ const simulateTyping = async (chat, text) => {
 // gagal (timeout/rate limit) - itu penyebab "diubah oleh" kadang gak muncul. Sekarang pakai
 // drive.files.get() yang punya field modifiedTime & lastModifyingUser langsung di metadata file
 // itu sendiri - cuma 1 API call ringan, gak perlu paginate riwayat revisi sama sekali.
-async function getAdminTerakhirEdit() {
+//
+// Ditambah RETRY 2x dengan jeda singkat, buat nutup kasus gagal sesaat (network hiccup pas
+// momen kirim notif). Kalau tetap gagal setelah retry, return null (pemanggil akan tetap
+// nampilin baris "Diubah oleh" tapi dengan keterangan gagal, bukan disembunyikan diam-diam).
+async function getAdminTerakhirEdit(percobaanKe = 1) {
     try {
         const authClient = await authorize();
         if (!authClient) return null;
@@ -982,7 +986,11 @@ async function getAdminTerakhirEdit() {
             waktu: res.data.modifiedTime,
         };
     } catch (err) {
-        console.log("⚠️ Gagal ambil info admin terakhir edit:", err.message);
+        console.log(`⚠️ Gagal ambil info admin terakhir edit (percobaan ${percobaanKe}/2):`, err.message);
+        if (percobaanKe < 2) {
+            await new Promise((res) => setTimeout(res, 2000));
+            return getAdminTerakhirEdit(percobaanKe + 1);
+        }
         return null;
     }
 }
@@ -1006,6 +1014,10 @@ async function kirimNotifikasiRevisi() {
         });
         headerNotif += `\n✏️ *Diubah oleh:* ${adminInfo.nama}`;
         headerNotif += `\n🕒 *Waktu edit:* ${waktuFormat} WITA`;
+    } else {
+        // Tetap tampilkan barisnya biar jelas ini emang gagal dideteksi (jaringan/API),
+        // bukan diam-diam disembunyikan seolah fiturnya gak jalan.
+        headerNotif += `\n✏️ *Diubah oleh:* (gagal dideteksi - coba lagi di revisi berikutnya)`;
     }
     headerNotif += `\n\nDetail lengkap di bawah ini:`;
 
