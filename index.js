@@ -222,34 +222,54 @@ function tentukanKategori(namaAlat) {
 // ============================================================================
 // 4. ENGINE PARSING GOOGLE SHEETS JADWAL
 // ============================================================================
+// PENTING: fungsi ini SENGAJA tidak menelan error jadi `null` untuk kasus fetch/parse gagal.
+// Dulu semua error (network gagal, auth gagal, dsb) ditangkap diam-diam lalu dianggap "[]" (kosong),
+// yang artinya kalau bulan ini gagal diambil tapi bulan depan berhasil, hasil gabungannya jadi
+// data PARSIAL (cuma bulan depan doang) tapi tetap dianggap "data terbaru yang valid" oleh jalankanRonda.
+// Ini yang bikin SEMUA event bulan ini keliatan "hilang" (bug: event dihapus padahal enggak),
+// terus muncul lagi sebagai "event baru" begitu fetch berikutnya berhasil normal lagi.
+// Sekarang: error fetch/parse asli DILEMPAR ke atas, biar jalankanRonda tau ronda ini gagal total
+// dan skip (gak nimpa objekDataLama dengan data yang gak lengkap).
 async function getJadwalDariExcel(targetDateObj) {
     const authClient = await authorize();
-    if (!authClient) return null;
+    if (!authClient) throw new Error("Gagal autentikasi Google Drive (authorize() mengembalikan null)");
     const drive = google.drive({ version: "v3", auth: authClient });
 
-    try {
-        const res = await drive.files.get({ fileId: SPREADSHEET_ID, alt: "media" }, { responseType: "arraybuffer" });
-        const workbook = XLSX.read(res.data, { type: "buffer" });
-        const namaBulan = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"];
-        const targetSheetName = `${namaBulan[targetDateObj.getMonth()]} ${targetDateObj.getFullYear()}`;
-        
-        const worksheet = workbook.Sheets[targetSheetName];
-        if (!worksheet) return null;
+    const res = await drive.files.get({ fileId: SPREADSHEET_ID, alt: "media" }, { responseType: "arraybuffer" });
+    const workbook = XLSX.read(res.data, { type: "buffer" });
+    const namaBulan = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"];
+    const targetSheetName = `${namaBulan[targetDateObj.getMonth()]} ${targetDateObj.getFullYear()}`;
 
-        return XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-    } catch (error) {
-        return null;
-    }
+    const worksheet = workbook.Sheets[targetSheetName];
+    // Sheet memang belum dibuat (misal tahun depan) - ini BUKAN error, wajar kosong.
+    if (!worksheet) return [];
+
+    return XLSX.utils.sheet_to_json(worksheet, { header: 1 });
 }
 
+// Sengaja TIDAK ada try/catch di sini. Kalau salah satu bulan gagal diambil (network error,
+// auth expired, dll), biarkan error-nya menjalar ke pemanggilnya (jalankanRonda dkk) supaya
+// ronda tsb di-skip total, BUKAN dianggap "data terbaru" yang cuma separuh.
 async function getJadwalMultiBulan() {
     const dateIni = new Date();
     const dateDepan = new Date();
     dateDepan.setMonth(dateDepan.getMonth() + 1);
-    
-    const dataIni = await getJadwalDariExcel(dateIni) || [];
-    const dataDepan = await getJadwalDariExcel(dateDepan) || [];
+
+    const dataIni = await getJadwalDariExcel(dateIni);
+    const dataDepan = await getJadwalDariExcel(dateDepan);
     return [...dataIni, ...dataDepan];
+}
+
+// Helper aman buat dipakai di message handler: pakai cache kalau ada (responsif),
+// fallback fetch langsung kalau cache belum ada, dan gak pernah nge-throw ke caller.
+async function ambilDataJadwal() {
+    if (objekDataLama) return objekDataLama;
+    try {
+        return await getJadwalMultiBulan();
+    } catch (err) {
+        console.log("⚠️ Gagal fetch jadwal (fallback ke array kosong):", err.message);
+        return [];
+    }
 }
 
 function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
@@ -934,36 +954,35 @@ const simulateTyping = async (chat, text) => {
     } catch (error) {}
 };
 
-// Ambil nama admin yang terakhir mengedit spreadsheet, via Google Drive Revisions API.
+// Ambil nama admin yang terakhir mengedit spreadsheet.
 // Cukup pakai scope drive.readonly yang sudah ada (tidak perlu izin tambahan).
-// Catatan: ini atribusi per-FILE (siapa yang terakhir nyentuh file), bukan per-cell.
+//
+// CATATAN PERBAIKAN: sebelumnya fungsi ini pakai drive.revisions.list() yang di-paginate
+// sampai halaman terakhir untuk nemuin revisi paling baru. Untuk spreadsheet yang sering
+// banget diedit (riwayat revisi bisa numpuk ratusan/ribuan), paginate ini kadang lambat atau
+// gagal (timeout/rate limit) - itu penyebab "diubah oleh" kadang gak muncul. Sekarang pakai
+// drive.files.get() yang punya field modifiedTime & lastModifyingUser langsung di metadata file
+// itu sendiri - cuma 1 API call ringan, gak perlu paginate riwayat revisi sama sekali.
 async function getAdminTerakhirEdit() {
     try {
         const authClient = await authorize();
         if (!authClient) return null;
         const drive = google.drive({ version: "v3", auth: authClient });
 
-        let revisiTerakhir = null;
-        let pageToken = null;
-        do {
-            const res = await drive.revisions.list({
-                fileId: SPREADSHEET_ID,
-                fields: "nextPageToken, revisions(id, modifiedTime, lastModifyingUser(displayName, emailAddress))",
-                pageSize: 1000,
-                pageToken: pageToken || undefined,
-            });
-            const revisions = res.data.revisions || [];
-            if (revisions.length > 0) revisiTerakhir = revisions[revisions.length - 1];
-            pageToken = res.data.nextPageToken;
-        } while (pageToken);
+        const res = await drive.files.get({
+            fileId: SPREADSHEET_ID,
+            fields: "modifiedTime, lastModifyingUser(displayName, emailAddress)",
+            supportsAllDrives: true,
+        });
 
-        if (!revisiTerakhir || !revisiTerakhir.lastModifyingUser) return null;
+        const user = res.data.lastModifyingUser;
+        if (!user) return null;
         return {
-            nama: revisiTerakhir.lastModifyingUser.displayName || revisiTerakhir.lastModifyingUser.emailAddress || "Tidak diketahui",
-            waktu: revisiTerakhir.modifiedTime,
+            nama: user.displayName || user.emailAddress || "Tidak diketahui",
+            waktu: res.data.modifiedTime,
         };
     } catch (err) {
-        console.log("⚠️ Gagal ambil riwayat revisi (info admin dilewati):", err.message);
+        console.log("⚠️ Gagal ambil info admin terakhir edit:", err.message);
         return null;
     }
 }
@@ -1003,11 +1022,24 @@ const jalankanRonda = async () => {
         const dataTerbaru = await getJadwalMultiBulan();
         if (!dataTerbaru || dataTerbaru.length === 0) return;
 
-        if (objekDataLama && JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
-            console.log("🔔 Ada perubahan jadwal!");
-            const daftarRevisiBaru = cariPerubahanEvent(objekDataLama, dataTerbaru);
-            if (daftarRevisiBaru.length > 0) {
-                antrianPerubahanPending.push(...daftarRevisiBaru);
+        if (objekDataLama) {
+            // Sanity check tambahan: kalau jumlah event tiba-tiba anjlok drastis (>50%)
+            // dibanding ronda sebelumnya, ini kemungkinan besar data yang kefetch rusak/parsial
+            // (misal salah satu bulan gagal ke-parse tapi gak nge-throw error), BUKAN beneran
+            // banyak event dihapus admin sekaligus. Skip ronda ini biar gak salah alarm massal.
+            const jumlahEventLama = Object.keys(ekstrakStateEvent(objekDataLama)).length;
+            const jumlahEventBaru = Object.keys(ekstrakStateEvent(dataTerbaru)).length;
+            if (jumlahEventLama >= 5 && jumlahEventBaru < jumlahEventLama * 0.5) {
+                console.log(`⚠️ Jumlah event anjlok drastis (${jumlahEventLama} -> ${jumlahEventBaru}), kemungkinan data korup/parsial. Ronda ini di-skip, objekDataLama TIDAK ditimpa.`);
+                return;
+            }
+
+            if (JSON.stringify(dataTerbaru) !== JSON.stringify(objekDataLama)) {
+                console.log("🔔 Ada perubahan jadwal!");
+                const daftarRevisiBaru = cariPerubahanEvent(objekDataLama, dataTerbaru);
+                if (daftarRevisiBaru.length > 0) {
+                    antrianPerubahanPending.push(...daftarRevisiBaru);
+                }
             }
         }
         objekDataLama = dataTerbaru;
@@ -1020,9 +1052,10 @@ const jalankanRonda = async () => {
             await kirimNotifikasiRevisi();
         }
 
-        // Cek konflik jadwal (crew/alat bentrok di tanggal yang sama), dedupe otomatis
+        // Cek konflik jadwal (crew bentrok loading s/d acara), dedupe otomatis
         await cekDanNotifKonflikJadwal(dataTerbaru);
     } catch (err) {
+        console.log(`❌ Sistem Ronda Gagal (objekDataLama TIDAK ditimpa): ${err.message}`);
         sendSystemAlert(`❌ Sistem Ronda Gagal: ${err.message}`);
     }
 };
@@ -1309,15 +1342,19 @@ client.on("ready", async () => {
     isBotReady = true;
     jumlahRetryReconnect = 0; // reset counter tiap kali berhasil connect
 
-    objekDataLama = await getJadwalMultiBulan();
+    try {
+        objekDataLama = await getJadwalMultiBulan();
+    } catch (err) {
+        console.log("⚠️ Gagal ambil jadwal awal saat startup, akan dicoba lagi di ronda berikutnya:", err.message);
+    }
     setInterval(jalankanRonda, WAKTU_RONDA_MS);
 
     cron.schedule('0 6 * * *', async () => {
         try {
             const dateObj = new Date();
             const tglHariIni = dateObj.getDate().toString();
-            const freshData = await getJadwalMultiBulan(); 
-            if (freshData) objekDataLama = freshData;
+            const freshData = await getJadwalMultiBulan();
+            objekDataLama = freshData;
 
             const daftarPesan = prosesDataKePesanWA(objekDataLama, tglHariIni, "");
             let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
@@ -1423,7 +1460,7 @@ client.on("message", async (msg) => {
 
     else if (text === "cek konflik" || text === "konflik jadwal") {
         await balasPesan(`⏳ Mengecek bentrokan jadwal crew (loading s/d acara)...`);
-        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const dataCek = await ambilDataJadwal();
         const hasilKonflik = cekKonflikJadwal(dataCek);
         if (hasilKonflik.length === 0) {
             await balasPesan(`✅ Tidak ada bentrokan jadwal crew yang terdeteksi (untuk event hari ini & ke depan).`);
@@ -1441,7 +1478,7 @@ client.on("message", async (msg) => {
         if (namaCrew.length < 2) return balasPesan("⚠️ Nama crew terlalu pendek. Minimal 2 huruf.");
 
         await balasPesan(`⏳ Mencari jadwal crew *${namaCrew.toUpperCase()}*...`);
-        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const dataCek = await ambilDataJadwal();
         const hasil = cariJadwalByCrew(dataCek, namaCrew);
 
         if (hasil.length === 0) {
@@ -1462,7 +1499,7 @@ client.on("message", async (msg) => {
         if (namaAlat.length < 2) return balasPesan("⚠️ Nama alat terlalu pendek. Minimal 2 huruf.");
 
         await balasPesan(`⏳ Mencari jadwal pemakaian alat *${namaAlat.toUpperCase()}*...`);
-        const dataCek = objekDataLama || (await getJadwalMultiBulan());
+        const dataCek = await ambilDataJadwal();
         const hasil = cariJadwalByAlat(dataCek, namaAlat);
 
         if (hasil.length === 0) {
@@ -1499,7 +1536,7 @@ client.on("message", async (msg) => {
 
         await balasPesan(`⏳ Mencari *"${keyword}"* untuk jadwal ${infoWaktu}...`);
 
-        const dataCache = objekDataLama || (await getJadwalMultiBulan());
+        const dataCache = await ambilDataJadwal();
         const daftarPesan = prosesDataKePesanWA(dataCache, targetTanggal, keyword);
 
         if (daftarPesan.length === 0) {
@@ -1532,9 +1569,9 @@ client.on("message", async (msg) => {
 
         await balasPesan(`⚡ Menarik data ${labelTarget} (Cache Mode)...`);
 
-        if (!objekDataLama) objekDataLama = await getJadwalMultiBulan();
+        const dataUntukPerintah = await ambilDataJadwal();
         const keywordVirtual = text === "3" ? "[SHOW_ALL]" : ""; 
-        const daftarPesan = prosesDataKePesanWA(objekDataLama, tglTarget, keywordVirtual);
+        const daftarPesan = prosesDataKePesanWA(dataUntukPerintah, tglTarget, keywordVirtual);
 
         if (daftarPesan.length === 0) {
             await balasPesan(`ℹ️ Tidak ada jadwal untuk ${labelTarget}.`);
