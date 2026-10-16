@@ -31,6 +31,18 @@ const TELEGRAM_BOT_TOKEN = ""; // Token dari @BotFather
 const TELEGRAM_CHAT_ID = ""; // Chat ID tujuan notifikasi fallback
 
 // ============================================================================
+// KONFIGURASI RONDA & PENGINGAT PAYROLL
+// ============================================================================
+const WAKTU_RONDA_GAJI_MS = 5 * 60 * 1000;      // Cek spreadsheet payroll tiap 5 menit
+const JEDA_TENANG_GAJI_MS = 10 * 60 * 1000;     // Tunggu data "tenang" 10 menit (admin selesai ngetik) baru kirim notif
+const BATAS_TUNGGU_GAJI_MS = 60 * 60 * 1000;    // Maksimal nunggu 1 jam, setelah itu tetap dikirim
+const NOTIF_PAYROLL_SEMUA_KARYAWAN = true;      // false = notif cuma soal gaji pribadi (matikan ringkasan karyawan lain)
+const HARI_PENGINGAT_PERIODE_1 = 15;            // Tanggal pengingat pencairan periode 1 (periode 2 = hari terakhir bulan)
+const FILE_SNAPSHOT_GAJI = "snapshot_gaji.json"; // Disimpan di disk supaya restart bot tidak kehilangan baseline
+// Tulisan di sheet (baris TOTAL TRANSFER, kolom kanan) yang berarti periode sudah ditransfer
+const PENANDA_GAJI_CAIR = /^(done|lunas|paid|selesai|sudah transfer|sudah tf|transferred|cair)$/i;
+
+// ============================================================================
 // KONFIGURASI SIKLUS KONTRAK
 // ============================================================================
 const BULAN_MULAI_KONTRAK = 10; // 10 = Oktober. Ganti kalau kontrak beda tanggal mulai.
@@ -43,7 +55,7 @@ const BULAN_MAP = {
 const NAMA_BULAN_ID = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
     "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
 
-let objekDataLama = null;
+let objekDataLama = null; 
 let globalAuthClient = null;
 let isBotReady = false;
 
@@ -59,6 +71,16 @@ let jumlahRetryReconnect = 0;
 
 // Cache hasil cek konflik jadwal terakhir, buat dedupe notifikasi
 let daftarKonflikSebelumnya = [];
+
+// State ronda payroll
+let snapshotGajiDinotif = null;     // kondisi terakhir yang SUDAH diinfokan ke WA
+let snapshotGajiTerakhir = null;    // snapshot ronda sebelumnya (buat deteksi kapan data terakhir berubah)
+let waktuGajiBerubahTerakhir = 0;
+let waktuGajiPendingMulai = 0;
+let rondaGajiBerjalan = false;      // cegah 2 ronda payroll jalan bersamaan
+let gagalRondaGajiBeruntun = 0;
+let rondaJadwalBerjalan = false;    // cegah 2 ronda jadwal jalan bersamaan
+let penjadwalSudahAktif = false;    // cegah setInterval/cron dobel kalau event "ready" kepanggil lagi setelah reconnect
 
 // ============================================================================
 // 2. SISTEM LOGIN OAUTH 2.0
@@ -317,7 +339,7 @@ function prosesDataKePesanWA(rawData, tanggalAngka = "", keywordCari = "") {
                     eventDate.setHours(0,0,0,0);
                     const today = new Date();
                     today.setHours(0,0,0,0);
-                    if (eventDate < today) continue;
+                    if (eventDate < today) continue; 
                 }
             }
 
@@ -882,51 +904,87 @@ async function getProyeksiTabungan(namaTarget) {
 // ============================================================================
 // ENGINE PAYROLL SELURUH KARYAWAN (spreadsheet TERPISAH dari gaji pribadi JAYAK)
 // ============================================================================
-// Sheet di spreadsheet ini namanya "AGUSTUS26" (nempel, 2 digit tahun) - BEDA
-// dengan format "AGUSTUS 2026" yang dipakai SPREADSHEET_ID_GAJI biasa.
+// Format nama sheet di spreadsheet ini: "OKTOBER26" (nempel, 2 digit tahun),
+// BEDA dengan "AGUSTUS 2026" di spreadsheet gaji pribadi.
+
+const formatRupiah = (num) => "Rp " + (num || 0).toLocaleString("id-ID");
+
+// Ubah teks sel ("262.000", "-", "") jadi angka. "-" dan kosong = 0.
+function parseAngkaSheet(v) {
+    if (v === undefined || v === null || v === "") return 0;
+    const s = v.toString().replace(/\./g, "").replace(/,/g, "").replace(/[^\d-]/g, "");
+    if (s === "" || isNaN(s)) return 0;
+    return parseInt(s);
+}
+
+// Header yang BUKAN nama karyawan (kolom total, catatan, dsb) - jangan dihitung sebagai orang.
+const NAMA_BUKAN_KARYAWAN = /^(TOTAL|VENUE|TGL|JUMLAH|SUBTOTAL|BULAN|KETERANGAN|KET|NOTE|CATATAN|DONE)$/i;
+
+// Jarak edit (Levenshtein) buat toleransi typo nama: "tomi" -> "TOMY"
+function jarakEdit(a, b) {
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+    for (let j = 1; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        }
+    }
+    return dp[m][n];
+}
+
 function getNamaSheetPayrollAll(dateObj) {
     const namaBulan = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"];
     const tahun2Digit = dateObj.getFullYear().toString().slice(-2);
     return `${namaBulan[dateObj.getMonth()]}${tahun2Digit}`;
 }
 
-// Ambil raw rows 1 sheet bulan tertentu dari spreadsheet payroll-all.
-// queryBulan opsional (misal "agustus") buat lihat arsip bulan lain; default bulan berjalan.
+// Terjemahkan error Google API jadi pesan yang jelas (dulu semua error keliatan sama-sama "gagal")
+function pesanErrorSheets(error) {
+    const kode = error && (error.code || (error.response && error.response.status));
+    const teks = (error && error.message) || "";
+    if (kode === 403) return "🚫 Akun Google yang dipakai bot belum punya akses ke spreadsheet payroll. Share spreadsheet-nya ke akun tsb (minimal Viewer).";
+    if (kode === 404) return "❓ Spreadsheet payroll tidak ditemukan. Cek nilai SPREADSHEET_ID_GAJI_ALL di kode.";
+    if (/not supported for this document/i.test(teks)) return "⚠️ File payroll bukan Google Sheets asli (kemungkinan file Excel yang diupload). Convert dulu ke Google Sheets.";
+    return `🚨 Error payroll: ${teks}`;
+}
+
+// Ambil raw rows 1 sheet bulan dari spreadsheet payroll-all.
+// queryBulan opsional ("agustus", atau nama sheet persis "AGUSTUS26"); default = bulan berjalan,
+// dan kalau sheet bulan berjalan belum dibuat, mundur ke bulan terakhir yang ada.
 async function ambilSheetPayrollAll(queryBulan = null) {
     const authClient = await authorize();
     if (!authClient) throw new Error("Gagal autentikasi Google Drive");
     const sheets = google.sheets({ version: "v4", auth: authClient });
 
-    const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID_GAJI_ALL });
+    const spreadsheet = await sheets.spreadsheets.get({
+        spreadsheetId: SPREADSHEET_ID_GAJI_ALL,
+        fields: "sheets.properties.title",
+    });
     const allSheets = spreadsheet.data.sheets.map((s) => s.properties.title);
 
-    let sheetAktif;
+    let sheetAktif = null;
     if (queryBulan) {
-        sheetAktif = allSheets.find((s) => s.toUpperCase().includes(queryBulan.toUpperCase()));
-        if (!sheetAktif) return { error: `ℹ️ Arsip bulan *${queryBulan.toUpperCase()}* tidak ditemukan di spreadsheet payroll.` };
+        const q = queryBulan.toUpperCase().trim();
+        sheetAktif = allSheets.find((s) => s.toUpperCase() === q) || allSheets.find((s) => s.toUpperCase().includes(q));
+        if (!sheetAktif) return { error: `ℹ️ Arsip bulan *${q}* tidak ditemukan.\nSheet yang ada: ${allSheets.join(", ")}` };
     } else {
-        sheetAktif = getNamaSheetPayrollAll(new Date());
-        if (!allSheets.includes(sheetAktif)) sheetAktif = allSheets[allSheets.length - 1];
+        const sekarang = new Date();
+        for (let i = 0; i < 12 && !sheetAktif; i++) {
+            const nama = getNamaSheetPayrollAll(new Date(sekarang.getFullYear(), sekarang.getMonth() - i, 1));
+            if (allSheets.includes(nama)) sheetAktif = nama;
+        }
+        if (!sheetAktif) sheetAktif = allSheets[allSheets.length - 1];
     }
 
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID_GAJI_ALL, range: sheetAktif });
+    // Nama sheet WAJIB dikutip: "MEI26" kebaca sebagai alamat sel (kolom MEI, baris 26) kalau polos.
+    const range = `'${sheetAktif.replace(/'/g, "''")}'`;
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID_GAJI_ALL, range });
     return { sheetAktif, rawData: res.data.values || [] };
 }
 
-// Cari kolom (0-based) milik 1 nama karyawan, scan 5 baris pertama (baris header ada di situ).
-function cariKolomKaryawan(rawData, namaTarget) {
-    for (let r = 0; r < Math.min(5, rawData.length); r++) {
-        const row = rawData[r];
-        if (!row) continue;
-        for (let c = 0; c < row.length; c++) {
-            if (row[c] && row[c].toString().toUpperCase().trim() === namaTarget.toUpperCase().trim()) return c;
-        }
-    }
-    return -1;
-}
-
-// Cari SEMUA karyawan + kolomnya + timnya sekaligus.
-// Baris tim ada 1 baris DI ATAS baris header "TGL | VENUE | <nama-nama>".
+// Cari SEMUA karyawan + kolomnya + timnya.
+// Baris header = baris yang kolom A "TGL" dan kolom B "VENUE". Label tim (kalau ada) ada 1 baris di atasnya.
 function cariSemuaKaryawanDanTim(rawData) {
     let baseHeaderRow = -1;
     for (let r = 0; r < Math.min(6, rawData.length); r++) {
@@ -938,7 +996,7 @@ function cariSemuaKaryawanDanTim(rawData) {
     }
     if (baseHeaderRow === -1) return [];
 
-    const rowTim = rawData[baseHeaderRow - 1] || [];
+    const rowTim = baseHeaderRow > 0 ? (rawData[baseHeaderRow - 1] || []) : [];
     const rowNama = rawData[baseHeaderRow] || [];
 
     let karyawanList = [];
@@ -947,21 +1005,50 @@ function cariSemuaKaryawanDanTim(rawData) {
         const timLabel = rowTim[c] ? rowTim[c].toString().trim() : "";
         if (timLabel) timSekarang = timLabel;
         const nama = rowNama[c] ? rowNama[c].toString().trim() : "";
-        if (nama && nama.toUpperCase() !== "VENUE") karyawanList.push({ nama, col: c, tim: timSekarang });
+        if (!nama || NAMA_BUKAN_KARYAWAN.test(nama) || /^[\d.,\s-]+$/.test(nama)) continue;
+        karyawanList.push({ nama, col: c, tim: timSekarang });
     }
     return karyawanList;
 }
 
+// Cocokkan nama ketikan user ke daftar karyawan: persis > diawali > mengandung > typo mirip.
+// Hasil: { karyawan, saran, dikoreksi }
+function cariKaryawanByNama(karyawanList, query) {
+    const q = query.toUpperCase().trim();
+    const up = (k) => k.nama.toUpperCase();
+
+    let kandidat = karyawanList.filter((k) => up(k) === q);
+    if (kandidat.length >= 1) return { karyawan: kandidat[0], saran: [] };
+
+    kandidat = karyawanList.filter((k) => up(k).startsWith(q));
+    if (kandidat.length === 1) return { karyawan: kandidat[0], saran: [] };
+    if (kandidat.length > 1) return { karyawan: null, saran: kandidat.map((k) => k.nama) };
+
+    kandidat = karyawanList.filter((k) => up(k).includes(q));
+    if (kandidat.length === 1) return { karyawan: kandidat[0], saran: [] };
+    if (kandidat.length > 1) return { karyawan: null, saran: kandidat.map((k) => k.nama) };
+
+    const dekat = karyawanList.map((k) => ({ k, d: jarakEdit(up(k), q) })).filter((x) => x.d <= 2).sort((a, b) => a.d - b.d);
+    if (dekat.length === 0) return { karyawan: null, saran: [] };
+    if (dekat[0].d <= 1 && (dekat.length === 1 || dekat[1].d > dekat[0].d)) return { karyawan: dekat[0].k, saran: [], dikoreksi: true };
+    return { karyawan: null, saran: dekat.slice(0, 5).map((x) => x.k.nama) };
+}
+
+function pesanKaryawanTidakKetemu(query, sheetAktif, saran) {
+    let msg = `⚠️ Karyawan "${query}" tidak ditemukan di sheet ${sheetAktif}.`;
+    msg += saran.length > 0 ? `\n\nMaksud kamu: *${saran.join(", ")}*?` : `\n\nKetik \`daftar karyawan\` untuk lihat nama yang terdaftar.`;
+    return msg;
+}
+
 // Ekstrak ringkasan gaji 1 kolom (= 1 karyawan) dari rawData 1 sheet bulan.
-// Logikanya sama persis dengan parserEngineSlipGaji, cuma diparameterin by kolom
-// biar bisa dipakai berulang buat SEMUA karyawan, bukan cuma 1 nama target.
+// Logikanya sama dengan parserEngineSlipGaji, diparameterin by kolom biar bisa dipakai buat SEMUA karyawan.
 function extractRingkasanKaryawan(rawData, colIndex) {
     let mode = 0;
     let dataPeriode1 = [];
     let dataPeriode2 = [];
     let vars = {
         totalFee1: 0, kasbon1: 0, transfer1: 0,
-        totalFee2: 0, kasbon2: 0, liburLebih2: 0, sisaLibur2: 0, thr2: 0,
+        totalFee2: 0, kasbon2: 0, liburLebih2: 0, sisaLibur2: 0, sisa2: 0, thr2: 0,
         gajiPokok: 0, grandTotal: 0, potongTabungan: 0, transfer2: 0, summaryBulan: 0,
     };
 
@@ -970,13 +1057,7 @@ function extractRingkasanKaryawan(rawData, colIndex) {
         if (!row) continue;
         const col0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
         const col1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
-        const valTarget = row[colIndex];
-
-        let nilai = 0;
-        if (valTarget !== undefined && valTarget !== null && valTarget !== "") {
-            let valStr = valTarget.toString().replace(/\./g, "").replace(/,/g, "").replace(/[^\d-]/g, "");
-            if (!isNaN(valStr) && valStr !== "") nilai = parseInt(valStr);
-        }
+        const nilai = parseAngkaSheet(row[colIndex]);
 
         if (col0.includes("RECAP FEE TGL 1 -")) { mode = 1; continue; }
         if (col0.includes("RECAP FEE TGL 16") || col0.includes("RECAP FEE TGL 15")) { mode = 2; continue; }
@@ -995,6 +1076,7 @@ function extractRingkasanKaryawan(rawData, colIndex) {
             if (col1 === "POTONGAN KASBON") vars.kasbon2 = nilai;
             if (col1 === "LIBUR LEBIH") vars.liburLebih2 = nilai;
             if (col1 === "SISA LIBUR") vars.sisaLibur2 = nilai;
+            if (col1 === "SISA") vars.sisa2 = nilai;
             if (col1 === "THR") vars.thr2 = nilai;
             if (col1 === "GAJI POKOK") vars.gajiPokok = nilai;
             if (col1 === "GRAND TOTAL") vars.grandTotal = nilai;
@@ -1011,54 +1093,119 @@ function extractRingkasanKaryawan(rawData, colIndex) {
     return { ...vars, dataPeriode1, dataPeriode2 };
 }
 
-// FITUR 1: Slip gaji untuk SIAPA SAJA (bukan cuma JAYAK), dari spreadsheet payroll-all
+// Cari penanda "sudah ditransfer" (misal tulisan "Done") di baris TOTAL TRANSFER tiap periode.
+// Di sheet kamu: baris TOTAL TRANSFER periode 1 punya "Done" di kolom kanan setelah nama-nama karyawan.
+function cariStatusPeriode(rawData) {
+    let mode = 0;
+    const status = { p1: "", p2: "" };
+    for (const row of rawData) {
+        if (!row) continue;
+        const col0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+        const col1 = row[1] ? row[1].toString().toUpperCase().trim() : "";
+        if (col0.includes("RECAP FEE TGL 1 -")) { mode = 1; continue; }
+        if (col0.includes("RECAP FEE TGL 16") || col0.includes("RECAP FEE TGL 15")) { mode = 2; continue; }
+        if (col1 === "TOTAL TRANSFER" && (mode === 1 || mode === 2)) {
+            for (let c = 2; c < row.length; c++) {
+                const v = row[c] ? row[c].toString().trim() : "";
+                if (v && PENANDA_GAJI_CAIR.test(v)) { status[mode === 1 ? "p1" : "p2"] = v.toUpperCase(); break; }
+            }
+        }
+    }
+    return status;
+}
+
+const urutTgl = (a, b) => {
+    const na = parseInt(a.tgl.split("-")[0]);
+    const nb = parseInt(b.tgl.split("-")[0]);
+    return (isNaN(na) ? 99 : na) - (isNaN(nb) ? 99 : nb);
+};
+
+// FITUR: Slip gaji untuk SIAPA SAJA, rinci per periode (angka-angkanya nyambung dengan sheet)
 async function getSlipGajiKaryawan(namaKaryawan, queryBulan = null) {
     try {
         const hasil = await ambilSheetPayrollAll(queryBulan);
         if (hasil.error) return hasil.error;
         const { sheetAktif, rawData } = hasil;
 
-        const colIndex = cariKolomKaryawan(rawData, namaKaryawan);
-        if (colIndex === -1) {
-            return `⚠️ Nama "${namaKaryawan}" tidak ditemukan di sheet payroll ${sheetAktif}. Cek penulisan nama.`;
-        }
+        const karyawanList = cariSemuaKaryawanDanTim(rawData);
+        if (karyawanList.length === 0) return `⚠️ Daftar karyawan tidak terbaca di sheet *${sheetAktif}* (baris header "TGL | VENUE | nama..." tidak ditemukan).`;
 
-        const r = extractRingkasanKaryawan(rawData, colIndex);
-        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+        const cari = cariKaryawanByNama(karyawanList, namaKaryawan);
+        if (!cari.karyawan) return pesanKaryawanTidakKetemu(namaKaryawan, sheetAktif, cari.saran);
 
-        let msg = `━━━━━━━━━━━━━━━━━━━━\n💰 *SLIP GAJI: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-        msg += `👤 *NAMA:* ${namaKaryawan.toUpperCase()}\n\n`;
-        msg += `📋 *RINCIAN JOB*\n`;
-        msg += `_Tgl 1-15:_\n`;
-        msg += r.dataPeriode1.length === 0 ? `_(Tidak ada job)_\n` : r.dataPeriode1.map((j) => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
-        msg += `\n_Tgl 16-akhir bulan:_\n`;
-        msg += r.dataPeriode2.length === 0 ? `_(Tidak ada job)_\n` : r.dataPeriode2.map((j) => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
-        msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+        const k = cari.karyawan;
+        const r = extractRingkasanKaryawan(rawData, k.col);
+        const status = cariStatusPeriode(rawData);
+        const rp = formatRupiah;
+        const garis = `━━━━━━━━━━━━━━━━━━━━`;
+        const baris = (label, nilai, tanda) => nilai > 0 ? `${label}: ${tanda}${rp(nilai)}` : `${label}: -`;
 
-        const totalFeeGabungan = r.totalFee1 + r.totalFee2;
-        const totalKasbonGabungan = r.kasbon1 + r.kasbon2;
+        let msg = `${garis}\n💰 *SLIP GAJI: ${sheetAktif}*\n${garis}\n\n`;
+        msg += `👤 *NAMA:* ${k.nama.toUpperCase()}\n`;
+        if (k.tim && k.tim !== "LAINNYA") msg += `🏷️ *Tim:* ${k.tim}\n`;
+        if (cari.dikoreksi) msg += `🔎 _Dicocokkan dengan nama "${k.nama}"_\n`;
+        msg += `\n`;
 
-        msg += `📊 *RINGKASAN GAJI*\n`;
-        msg += `Total Fee Job: ${rp(totalFeeGabungan)}\n`;
-        msg += totalKasbonGabungan > 0 ? `Potongan Kasbon: -${rp(totalKasbonGabungan)}\n` : `Potongan Kasbon: -\n`;
-        msg += r.liburLebih2 > 0 ? `Potongan Libur Lebih: -${rp(r.liburLebih2)}\n` : `Potongan Libur Lebih: -\n`;
-        msg += r.sisaLibur2 > 0 ? `Sisa Libur: +${rp(r.sisaLibur2)}\n` : `Sisa Libur: -\n`;
-        msg += r.thr2 > 0 ? `THR: +${rp(r.thr2)}\n` : `THR: -\n`;
-        msg += `Gaji Pokok: +${rp(r.gajiPokok)}\n`;
+        // PERIODE 1
+        msg += `📋 *PERIODE 1 (Tgl 1-15)*${status.p1 ? `  ✅ ${status.p1}` : ""}\n`;
+        msg += r.dataPeriode1.length === 0 ? `_(Tidak ada job)_\n` : [...r.dataPeriode1].sort(urutTgl).map((j) => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
+        msg += `${baris("Total Fee", r.totalFee1, "")}\n`;
+        if (r.kasbon1 > 0) msg += `${baris("Potongan Kasbon", r.kasbon1, "-")}\n`;
+        msg += `*💸 Transfer Periode 1: ${rp(r.transfer1)}*\n`;
+        msg += `${garis}\n\n`;
+
+        // PERIODE 2
+        msg += `📋 *PERIODE 2 (Tgl 16-akhir bulan)*${status.p2 ? `  ✅ ${status.p2}` : ""}\n`;
+        msg += r.dataPeriode2.length === 0 ? `_(Tidak ada job)_\n` : [...r.dataPeriode2].sort(urutTgl).map((j) => `• Tgl ${j.tgl}: ${j.venue} - ${rp(j.fee)}`).join("\n") + "\n";
+        msg += `${baris("Total Fee", r.totalFee2, "")}\n`;
+        msg += `${baris("Potongan Kasbon", r.kasbon2, "-")}\n`;
+        msg += `${baris("Potongan Libur Lebih", r.liburLebih2, "-")}\n`;
+        msg += `${baris("Sisa Fee Bersih", r.sisa2, "")}\n`;
+        msg += `${baris("Sisa Libur", r.sisaLibur2, "+")}\n`;
+        if (r.thr2 > 0) msg += `THR: +${rp(r.thr2)}\n`;
+        msg += `${baris("Gaji Pokok", r.gajiPokok, "+")}\n`;
         msg += `— — — — — — — —\n`;
         msg += `*Grand Total:* ${rp(r.grandTotal)}\n`;
-        msg += r.potongTabungan > 0 ? `Potong Tabungan: -${rp(r.potongTabungan)}\n` : `Potong Tabungan: -\n`;
-        msg += `— — — — — — — —\n`;
-        msg += `*💵 TOTAL TRANSFER: ${rp(r.transfer1 + r.transfer2)}*\n`;
-        msg += `━━━━━━━━━━━━━━━━━━━━`;
+        msg += `${baris("Potong Tabungan", r.potongTabungan, "-")}\n`;
+        msg += `*💸 Transfer Periode 2: ${rp(r.transfer2)}*\n`;
+        msg += `${garis}\n\n`;
+
+        msg += `*💵 TOTAL DITERIMA BULAN INI: ${rp(r.transfer1 + r.transfer2)}*\n`;
+        msg += garis;
         return msg;
     } catch (error) {
         console.error("Error Slip Gaji Karyawan:", error);
-        return `🚨 Error: ${error.message}`;
+        return pesanErrorSheets(error);
     }
 }
 
-// FITUR 2: Rekap payroll company-wide (total cash-out bulan ini + breakdown per tim)
+// FITUR: Daftar nama karyawan (per tim) - biar tau penulisan nama yang benar
+async function getDaftarKaryawan(queryBulan = null) {
+    try {
+        const hasil = await ambilSheetPayrollAll(queryBulan);
+        if (hasil.error) return hasil.error;
+        const { sheetAktif, rawData } = hasil;
+        const karyawanList = cariSemuaKaryawanDanTim(rawData);
+        if (karyawanList.length === 0) return `⚠️ Daftar karyawan tidak terbaca di sheet ${sheetAktif}.`;
+
+        const perTim = {};
+        for (const k of karyawanList) {
+            if (!perTim[k.tim]) perTim[k.tim] = [];
+            perTim[k.tim].push(k.nama);
+        }
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n👥 *DAFTAR KARYAWAN: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        for (const [tim, daftar] of Object.entries(perTim)) {
+            if (Object.keys(perTim).length > 1 || tim !== "LAINNYA") msg += `🏷️ *${tim}* (${daftar.length})\n`;
+            msg += daftar.map((n) => `• ${n}`).join("\n") + "\n\n";
+        }
+        msg += `Total: *${karyawanList.length} karyawan*\n━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return pesanErrorSheets(error);
+    }
+}
+
+// FITUR: Rekap payroll company-wide (total cash-out + per periode + per tim)
 async function getRekapPayrollBulanIni(queryBulan = null) {
     try {
         const hasil = await ambilSheetPayrollAll(queryBulan);
@@ -1067,43 +1214,43 @@ async function getRekapPayrollBulanIni(queryBulan = null) {
 
         const karyawanList = cariSemuaKaryawanDanTim(rawData);
         if (karyawanList.length === 0) return `⚠️ Gagal membaca daftar karyawan dari sheet ${sheetAktif}.`;
+        const status = cariStatusPeriode(rawData);
+        const rp = formatRupiah;
 
-        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
-        let totalPayrollSemua = 0;
-        let totalKasbonSemua = 0;
+        let total1 = 0, total2 = 0, totalKasbon = 0, totalTabungan = 0, jumlahAktif = 0;
         let perTim = {};
-        let jumlahAktif = 0;
-
         for (const k of karyawanList) {
             const r = extractRingkasanKaryawan(rawData, k.col);
-            const totalTransferOrang = r.transfer1 + r.transfer2;
-            const totalKasbonOrang = r.kasbon1 + r.kasbon2;
-            if (totalTransferOrang <= 0 && totalKasbonOrang <= 0) continue;
-
-            totalPayrollSemua += totalTransferOrang;
-            totalKasbonSemua += totalKasbonOrang;
+            const totalOrang = r.transfer1 + r.transfer2;
+            const kasbonOrang = r.kasbon1 + r.kasbon2;
+            if (totalOrang <= 0 && kasbonOrang <= 0) continue;
+            total1 += r.transfer1;
+            total2 += r.transfer2;
+            totalKasbon += kasbonOrang;
+            totalTabungan += r.potongTabungan;
             jumlahAktif++;
-
-            if (!perTim[k.tim]) perTim[k.tim] = 0;
-            perTim[k.tim] += totalTransferOrang;
+            perTim[k.tim] = (perTim[k.tim] || 0) + totalOrang;
         }
 
         let msg = `━━━━━━━━━━━━━━━━━━━━\n🏢 *REKAP PAYROLL: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-        msg += `💵 *Total Payroll Bulan Ini:* ${rp(totalPayrollSemua)}\n`;
-        msg += `📉 *Total Kasbon Dipotong:* ${rp(totalKasbonSemua)}\n`;
-        msg += `👥 *Jumlah Karyawan Aktif:* ${jumlahAktif}\n\n`;
-        msg += `📊 *RINCIAN PER TIM*\n`;
-        for (const [tim, total] of Object.entries(perTim)) {
-            msg += `• ${tim}: ${rp(total)}\n`;
+        msg += `💵 *Total Payroll Bulan Ini:* ${rp(total1 + total2)}\n`;
+        msg += `   • Periode 1 (Tgl 1-15): ${rp(total1)}${status.p1 ? ` ✅ ${status.p1}` : ""}\n`;
+        msg += `   • Periode 2 (Tgl 16-akhir): ${rp(total2)}${status.p2 ? ` ✅ ${status.p2}` : ""}\n`;
+        msg += `📉 *Total Kasbon Dipotong:* ${rp(totalKasbon)}\n`;
+        msg += `🐷 *Total Tabungan Dipotong:* ${rp(totalTabungan)}\n`;
+        msg += `👥 *Jumlah Karyawan Aktif:* ${jumlahAktif}\n`;
+        if (Object.keys(perTim).length > 1 || !perTim["LAINNYA"]) {
+            msg += `\n📊 *RINCIAN PER TIM*\n`;
+            for (const [tim, total] of Object.entries(perTim)) msg += `• ${tim}: ${rp(total)}\n`;
         }
         msg += `\n━━━━━━━━━━━━━━━━━━━━`;
         return msg;
     } catch (error) {
-        return `🚨 Error Rekap Payroll: ${error.message}`;
+        return pesanErrorSheets(error);
     }
 }
 
-// FITUR 3: Daftar karyawan dengan kasbon aktif bulan ini, diurut dari terbesar
+// FITUR: Daftar kasbon aktif, diurut dari terbesar
 async function getDaftarKasbonAktif(queryBulan = null) {
     try {
         const hasil = await ambilSheetPayrollAll(queryBulan);
@@ -1111,29 +1258,32 @@ async function getDaftarKasbonAktif(queryBulan = null) {
         const { sheetAktif, rawData } = hasil;
 
         const karyawanList = cariSemuaKaryawanDanTim(rawData);
-        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+        const rp = formatRupiah;
 
         let daftarKasbon = [];
         for (const k of karyawanList) {
             const r = extractRingkasanKaryawan(rawData, k.col);
             const totalKasbon = r.kasbon1 + r.kasbon2;
-            if (totalKasbon > 0) daftarKasbon.push({ nama: k.nama, kasbon: totalKasbon });
+            if (totalKasbon > 0) daftarKasbon.push({ nama: k.nama, kasbon: totalKasbon, k1: r.kasbon1, k2: r.kasbon2 });
         }
         daftarKasbon.sort((a, b) => b.kasbon - a.kasbon);
 
         if (daftarKasbon.length === 0) return `✅ Tidak ada kasbon aktif bulan ini (${sheetAktif}).`;
 
         let msg = `━━━━━━━━━━━━━━━━━━━━\n📉 *DAFTAR KASBON AKTIF: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-        daftarKasbon.forEach((k, idx) => { msg += `${idx + 1}. *${k.nama}* - ${rp(k.kasbon)}\n`; });
-        msg += `\n💰 *Total Kasbon:* ${rp(daftarKasbon.reduce((s, k) => s + k.kasbon, 0))}`;
+        daftarKasbon.forEach((k, idx) => {
+            const rinci = k.k1 > 0 && k.k2 > 0 ? ` _(P1 ${rp(k.k1)} + P2 ${rp(k.k2)})_` : "";
+            msg += `${idx + 1}. *${k.nama}* - ${rp(k.kasbon)}${rinci}\n`;
+        });
+        msg += `\n👥 ${daftarKasbon.length} karyawan | 💰 *Total Kasbon:* ${rp(daftarKasbon.reduce((s, k) => s + k.kasbon, 0))}`;
         msg += `\n━━━━━━━━━━━━━━━━━━━━`;
         return msg;
     } catch (error) {
-        return `🚨 Error Kasbon: ${error.message}`;
+        return pesanErrorSheets(error);
     }
 }
 
-// FITUR 4: Leaderboard - top fee tertinggi & job terbanyak bulan ini
+// FITUR: Leaderboard TOP 10 - fee tertinggi & job terbanyak
 async function getLeaderboardPayroll(queryBulan = null) {
     try {
         const hasil = await ambilSheetPayrollAll(queryBulan);
@@ -1141,7 +1291,7 @@ async function getLeaderboardPayroll(queryBulan = null) {
         const { sheetAktif, rawData } = hasil;
 
         const karyawanList = cariSemuaKaryawanDanTim(rawData);
-        const rp = (num) => "Rp " + num.toLocaleString("id-ID");
+        const rp = formatRupiah;
 
         let rincian = [];
         for (const k of karyawanList) {
@@ -1151,19 +1301,409 @@ async function getLeaderboardPayroll(queryBulan = null) {
             if (totalFee <= 0 && totalJob <= 0) continue;
             rincian.push({ nama: k.nama, totalJob, totalFee });
         }
+        if (rincian.length === 0) return `ℹ️ Belum ada data fee/job di sheet ${sheetAktif}.`;
 
-        const topFee = [...rincian].sort((a, b) => b.totalFee - a.totalFee).slice(0, 5);
-        const topJob = [...rincian].sort((a, b) => b.totalJob - a.totalJob).slice(0, 5);
+        const medali = (idx) => (idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : `${idx + 1}.`);
+        const topFee = [...rincian].sort((a, b) => b.totalFee - a.totalFee).slice(0, 10);
+        const topJob = [...rincian].sort((a, b) => b.totalJob - a.totalJob || b.totalFee - a.totalFee).slice(0, 10);
 
-        let msg = `━━━━━━━━━━━━━━━━━━━━\n🏆 *LEADERBOARD: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-        msg += `💰 *Top 5 Fee Tertinggi:*\n`;
-        topFee.forEach((k, idx) => { msg += `${idx + 1}. ${k.nama} - ${rp(k.totalFee)}\n`; });
-        msg += `\n📅 *Top 5 Job Terbanyak:*\n`;
-        topJob.forEach((k, idx) => { msg += `${idx + 1}. ${k.nama} - ${k.totalJob} job\n`; });
-        msg += `\n━━━━━━━━━━━━━━━━━━━━`;
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n🏆 *LEADERBOARD TOP 10: ${sheetAktif}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `💰 *Top 10 Fee Tertinggi:*\n`;
+        topFee.forEach((k, idx) => { msg += `${medali(idx)} ${k.nama} - ${rp(k.totalFee)}\n`; });
+        msg += `\n📅 *Top 10 Job Terbanyak:*\n`;
+        topJob.forEach((k, idx) => { msg += `${medali(idx)} ${k.nama} - ${k.totalJob} job\n`; });
+        msg += `\n_Dari ${rincian.length} karyawan yang punya fee bulan ini._\n━━━━━━━━━━━━━━━━━━━━`;
         return msg;
     } catch (error) {
-        return `🚨 Error Leaderboard: ${error.message}`;
+        return pesanErrorSheets(error);
+    }
+}
+
+// Baca bagian TABUNGAN di bawah sheet: baris "TABUNGAN" -> header "BULAN | nama..." -> baris per bulan -> "TOTAL".
+function parseTabunganSection(rawData) {
+    let idxHeader = -1;
+    for (let i = 0; i < rawData.length - 1; i++) {
+        const row = rawData[i];
+        if (!row) continue;
+        const c0 = row[0] ? row[0].toString().toUpperCase().trim() : "";
+        if (c0 === "TABUNGAN") {
+            const next = rawData[i + 1];
+            if (next && next[1] && next[1].toString().toUpperCase().trim() === "BULAN") { idxHeader = i + 1; break; }
+        }
+    }
+    if (idxHeader === -1) return null;
+
+    const header = rawData[idxHeader];
+    const kolom = [];
+    for (let c = 2; c < header.length; c++) {
+        const n = header[c] ? header[c].toString().trim() : "";
+        if (n && !NAMA_BUKAN_KARYAWAN.test(n)) kolom.push({ nama: n, col: c });
+    }
+
+    const bulanRows = [];
+    let totalRow = null;
+    for (let i = idxHeader + 1; i < rawData.length; i++) {
+        const row = rawData[i];
+        if (!row) continue;
+        const label = row[1] ? row[1].toString().trim() : "";
+        if (!label) { if (bulanRows.length > 0) break; else continue; }
+        if (label.toUpperCase() === "TOTAL") { totalRow = row; break; }
+        bulanRows.push({ label, row });
+    }
+    return { kolom, bulanRows, totalRow };
+}
+
+// FITUR: Tabungan karyawan. namaKaryawan = null -> semua karyawan (ranking total tabungan)
+async function getTabunganKaryawan(namaKaryawan = null, queryBulan = null) {
+    try {
+        const hasil = await ambilSheetPayrollAll(queryBulan);
+        if (hasil.error) return hasil.error;
+        const { sheetAktif, rawData } = hasil;
+        const tab = parseTabunganSection(rawData);
+        if (!tab || tab.kolom.length === 0) return `ℹ️ Bagian TABUNGAN tidak ditemukan di sheet ${sheetAktif}.`;
+        const rp = formatRupiah;
+
+        const hitungOrang = (k) => {
+            let totalHitung = 0;
+            const rincian = [];
+            for (const b of tab.bulanRows) {
+                const n = parseAngkaSheet(b.row[k.col]);
+                if (n > 0) { totalHitung += n; rincian.push({ bulan: b.label, nilai: n }); }
+            }
+            const totalSheet = tab.totalRow ? parseAngkaSheet(tab.totalRow[k.col]) : 0;
+            return { nama: k.nama, total: totalSheet > 0 ? totalSheet : totalHitung, rincian };
+        };
+
+        if (namaKaryawan) {
+            const cari = cariKaryawanByNama(tab.kolom, namaKaryawan);
+            if (!cari.karyawan) return pesanKaryawanTidakKetemu(namaKaryawan, sheetAktif, cari.saran);
+            const d = hitungOrang(cari.karyawan);
+            let msg = `━━━━━━━━━━━━━━━━━━━━\n🐷 *TABUNGAN: ${d.nama.toUpperCase()}*\n━━━━━━━━━━━━━━━━━━━━\n_Sumber: sheet ${sheetAktif}_\n\n`;
+            msg += d.rincian.length === 0 ? `_(Belum ada setoran tabungan)_\n` : d.rincian.map((x) => `• ${x.bulan}: ${rp(x.nilai)}`).join("\n") + "\n";
+            msg += `\n💰 *Total Tabungan:* ${rp(d.total)}\n━━━━━━━━━━━━━━━━━━━━`;
+            return msg;
+        }
+
+        const semua = tab.kolom.map(hitungOrang).filter((d) => d.total > 0).sort((a, b) => b.total - a.total);
+        if (semua.length === 0) return `ℹ️ Belum ada tabungan tercatat di sheet ${sheetAktif}.`;
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n🐷 *TABUNGAN SELURUH KARYAWAN*\n━━━━━━━━━━━━━━━━━━━━\n_Sumber: sheet ${sheetAktif}_\n\n`;
+        semua.forEach((d, idx) => { msg += `${idx + 1}. ${d.nama} - ${rp(d.total)}\n`; });
+        msg += `\n👥 ${semua.length} karyawan | 💰 *Total Dana Tabungan:* ${rp(semua.reduce((s, d) => s + d.total, 0))}\n━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return pesanErrorSheets(error);
+    }
+}
+
+// Nama sheet bulan sebelum "OKTOBER26" -> "SEPTEMBER26"
+function namaSheetBulanSebelumnya(namaSheet) {
+    const namaBulan = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"];
+    const idx = namaBulan.findIndex((n) => namaSheet.toUpperCase().startsWith(n));
+    const yy = parseInt(namaSheet.slice(-2));
+    if (idx === -1 || isNaN(yy)) return null;
+    const prevIdx = idx === 0 ? 11 : idx - 1;
+    const prevYY = idx === 0 ? yy - 1 : yy;
+    return `${namaBulan[prevIdx]}${String(prevYY).padStart(2, "0")}`;
+}
+
+// FITUR: Bandingkan gaji bulan ini vs bulan lalu untuk 1 karyawan
+async function getPerbandinganGaji(namaKaryawan) {
+    try {
+        const skrg = await ambilSheetPayrollAll();
+        if (skrg.error) return skrg.error;
+        const listSkrg = cariSemuaKaryawanDanTim(skrg.rawData);
+        const cari = cariKaryawanByNama(listSkrg, namaKaryawan);
+        if (!cari.karyawan) return pesanKaryawanTidakKetemu(namaKaryawan, skrg.sheetAktif, cari.saran);
+        const rSkrg = extractRingkasanKaryawan(skrg.rawData, cari.karyawan.col);
+
+        const namaPrev = namaSheetBulanSebelumnya(skrg.sheetAktif);
+        if (!namaPrev) return `⚠️ Gagal menentukan bulan sebelum ${skrg.sheetAktif}.`;
+        const prev = await ambilSheetPayrollAll(namaPrev);
+        if (prev.error) return prev.error;
+        const cariPrev = cariKaryawanByNama(cariSemuaKaryawanDanTim(prev.rawData), cari.karyawan.nama);
+        if (!cariPrev.karyawan) return `ℹ️ ${cari.karyawan.nama} tidak ada di sheet ${prev.sheetAktif}, jadi belum bisa dibandingkan.`;
+        const rPrev = extractRingkasanKaryawan(prev.rawData, cariPrev.karyawan.col);
+
+        const rp = formatRupiah;
+        const selisih = (lama, baru) => {
+            const d = baru - lama;
+            if (d === 0) return "sama";
+            const persen = lama > 0 ? ` (${d > 0 ? "+" : ""}${Math.round((d / lama) * 100)}%)` : "";
+            return `${d > 0 ? "▲ +" : "▼ -"}${rp(Math.abs(d))}${persen}`;
+        };
+        const feeS = rSkrg.totalFee1 + rSkrg.totalFee2, feeP = rPrev.totalFee1 + rPrev.totalFee2;
+        const jobS = rSkrg.dataPeriode1.length + rSkrg.dataPeriode2.length, jobP = rPrev.dataPeriode1.length + rPrev.dataPeriode2.length;
+        const kasS = rSkrg.kasbon1 + rSkrg.kasbon2, kasP = rPrev.kasbon1 + rPrev.kasbon2;
+        const trfS = rSkrg.transfer1 + rSkrg.transfer2, trfP = rPrev.transfer1 + rPrev.transfer2;
+
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n📊 *PERBANDINGAN GAJI: ${cari.karyawan.nama.toUpperCase()}*\n━━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `${skrg.sheetAktif} vs ${prev.sheetAktif}\n\n`;
+        msg += `• Total Fee Job: ${rp(feeP)} ➡️ ${rp(feeS)}\n   ${selisih(feeP, feeS)}\n`;
+        msg += `• Jumlah Job: ${jobP} ➡️ ${jobS}\n`;
+        msg += `• Potongan Kasbon: ${rp(kasP)} ➡️ ${rp(kasS)}\n`;
+        msg += `• Total Diterima: ${rp(trfP)} ➡️ ${rp(trfS)}\n   ${selisih(trfP, trfS)}\n`;
+        msg += `\n_Catatan: bulan berjalan belum tentu final._\n━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return pesanErrorSheets(error);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SNAPSHOT & RONDA PAYROLL (notifikasi otomatis kalau ada slip gaji masuk/berubah)
+// ----------------------------------------------------------------------------
+function buatSnapshotGaji(sheetAktif, rawData) {
+    const karyawan = {};
+    for (const k of cariSemuaKaryawanDanTim(rawData)) {
+        const r = extractRingkasanKaryawan(rawData, k.col);
+        karyawan[k.nama.toUpperCase()] = {
+            nama: k.nama,
+            tim: k.tim,
+            totalFee1: r.totalFee1,
+            totalFee2: r.totalFee2,
+            transfer1: r.transfer1,
+            transfer2: r.transfer2,
+            kasbon: r.kasbon1 + r.kasbon2,
+            jobs: [
+                ...r.dataPeriode1.map((j) => ({ p: 1, tgl: j.tgl, venue: j.venue, fee: j.fee })),
+                ...r.dataPeriode2.map((j) => ({ p: 2, tgl: j.tgl, venue: j.venue, fee: j.fee })),
+            ],
+        };
+    }
+    return { sheet: sheetAktif, karyawan, status: cariStatusPeriode(rawData) };
+}
+
+// Bandingkan snapshot terakhir yang SUDAH diinfokan (lama) dengan kondisi sekarang (baru).
+// Hasil: array { tipe: "cair" | "pribadi" | "admin", teks }
+function bandingkanSnapshotGaji(lama, baru) {
+    const hasil = [];
+    const rp = formatRupiah;
+    const namaSaya = NAMA_SAYA_DI_ABSEN.toUpperCase();
+    const labelPeriode = { p1: "TGL 1-15", p2: "TGL 16-AKHIR BULAN" };
+
+    // 1. Periode baru ditandai sudah ditransfer ("Done")
+    for (const kode of ["p1", "p2"]) {
+        if (!lama.status[kode] && baru.status[kode]) {
+            let total = 0, jumlah = 0;
+            for (const k of Object.values(baru.karyawan)) {
+                const t = kode === "p1" ? k.transfer1 : k.transfer2;
+                if (t > 0) { total += t; jumlah++; }
+            }
+            let teks = `✅ *GAJI PERIODE ${labelPeriode[kode]} (${baru.sheet}) SUDAH DITRANSFER*\n_Status di sheet: ${baru.status[kode]}_\n`;
+            const saya = baru.karyawan[namaSaya];
+            if (saya) teks += `\n👤 Gaji kamu (${saya.nama}): *${rp(kode === "p1" ? saya.transfer1 : saya.transfer2)}*`;
+            teks += `\n🏢 Total transfer seluruh karyawan: *${rp(total)}* (${jumlah} orang)`;
+            hasil.push({ tipe: "cair", teks });
+        }
+    }
+
+    // 2. Perubahan data gaji pribadi (fee job baru/diubah/dihapus, transfer, kasbon)
+    const lamaSaya = lama.karyawan[namaSaya];
+    const baruSaya = baru.karyawan[namaSaya];
+    if (lamaSaya && baruSaya) {
+        const baris = [];
+        const petaJob = (jobs) => {
+            const peta = {}, hitung = {};
+            for (const j of jobs) {
+                const dasar = `${j.p}|${j.tgl}|${j.venue}`;
+                hitung[dasar] = (hitung[dasar] || 0) + 1;
+                peta[`${dasar}#${hitung[dasar]}`] = j;
+            }
+            return peta;
+        };
+        const jl = petaJob(lamaSaya.jobs), jb = petaJob(baruSaya.jobs);
+        for (const key in jb) {
+            if (!jl[key]) baris.push(`➕ Fee baru: Tgl ${jb[key].tgl} - ${jb[key].venue} - ${rp(jb[key].fee)}`);
+            else if (jl[key].fee !== jb[key].fee) baris.push(`✏️ Fee diubah: Tgl ${jb[key].tgl} - ${jb[key].venue}: ${rp(jl[key].fee)} ➡️ ${rp(jb[key].fee)}`);
+        }
+        for (const key in jl) {
+            if (!jb[key]) baris.push(`➖ Fee dihapus: Tgl ${jl[key].tgl} - ${jl[key].venue} - ${rp(jl[key].fee)}`);
+        }
+        if (lamaSaya.transfer1 !== baruSaya.transfer1) baris.push(`💸 Transfer Tgl 1-15: ${rp(lamaSaya.transfer1)} ➡️ ${rp(baruSaya.transfer1)}`);
+        if (lamaSaya.transfer2 !== baruSaya.transfer2) baris.push(`💸 Transfer Tgl 16-akhir: ${rp(lamaSaya.transfer2)} ➡️ ${rp(baruSaya.transfer2)}`);
+        if (lamaSaya.kasbon !== baruSaya.kasbon) baris.push(`📉 Kasbon: ${rp(lamaSaya.kasbon)} ➡️ ${rp(baruSaya.kasbon)}`);
+        if (baris.length > 0) {
+            let teks = `💰 *UPDATE DATA GAJI KAMU (${baru.sheet})*\n\n${baris.join("\n")}`;
+            teks += `\n\n💵 Total diterima bulan ini saat ini: *${rp(baruSaya.transfer1 + baruSaya.transfer2)}*`;
+            hasil.push({ tipe: "pribadi", teks });
+        }
+    }
+
+    // 3. Ringkasan seluruh karyawan (bisa dimatikan lewat NOTIF_PAYROLL_SEMUA_KARYAWAN)
+    if (NOTIF_PAYROLL_SEMUA_KARYAWAN) {
+        const hitungTotal = (snap) => Object.values(snap.karyawan).reduce((s, k) => s + k.transfer1 + k.transfer2, 0);
+        const totalLama = hitungTotal(lama), totalBaru = hitungTotal(baru);
+        let berubah = 0;
+        const barisKasbon = [];
+        for (const key in baru.karyawan) {
+            if (key === namaSaya) continue;
+            const b = baru.karyawan[key], l = lama.karyawan[key];
+            if (!l || l.transfer1 !== b.transfer1 || l.transfer2 !== b.transfer2 || l.totalFee1 !== b.totalFee1 || l.totalFee2 !== b.totalFee2) berubah++;
+            const kasbonLama = l ? l.kasbon : 0;
+            if (b.kasbon !== kasbonLama) barisKasbon.push(`• ${b.nama}: ${rp(kasbonLama)} ➡️ ${rp(b.kasbon)}`);
+        }
+        if (berubah > 0 || barisKasbon.length > 0) {
+            let teks = `🏢 *UPDATE PAYROLL SELURUH KARYAWAN (${baru.sheet})*\n`;
+            if (berubah > 0) teks += `\n👥 ${berubah} karyawan lain berubah datanya`;
+            if (totalLama !== totalBaru) teks += `\n💵 Total payroll: ${rp(totalLama)} ➡️ ${rp(totalBaru)}`;
+            if (barisKasbon.length > 0) {
+                teks += `\n\n📉 *Perubahan kasbon:*\n${barisKasbon.slice(0, 15).join("\n")}`;
+                if (barisKasbon.length > 15) teks += `\n...dan ${barisKasbon.length - 15} lainnya`;
+            }
+            hasil.push({ tipe: "admin", teks });
+        }
+    }
+    return hasil;
+}
+
+async function muatSnapshotGaji() {
+    try {
+        const isi = await fs.readFile(FILE_SNAPSHOT_GAJI, "utf8");
+        const data = JSON.parse(isi);
+        if (data && data.sheet && data.karyawan && data.status) snapshotGajiDinotif = data;
+    } catch (e) { /* belum ada file snapshot, wajar di run pertama */ }
+}
+
+async function simpanSnapshotGaji() {
+    try { await fs.writeFile(FILE_SNAPSHOT_GAJI, JSON.stringify(snapshotGajiDinotif)); }
+    catch (e) { console.log("⚠️ Gagal simpan snapshot gaji:", e.message); }
+}
+
+async function kirimNotifikasiGaji(perubahan) {
+    const adminInfo = await getAdminTerakhirEdit(1, SPREADSHEET_ID_GAJI_ALL);
+    let header = `🔔 *INFO PAYROLL TERBARU*`;
+    if (adminInfo) {
+        const waktuFormat = new Date(adminInfo.waktu).toLocaleString("id-ID", { timeZone: "Asia/Makassar", dateStyle: "medium", timeStyle: "short" });
+        header += `\n✏️ *Diubah oleh:* ${adminInfo.nama}\n🕒 *Waktu edit:* ${waktuFormat} WITA`;
+    } else {
+        header += `\n✏️ *Diubah oleh:* (gagal dideteksi)`;
+    }
+    await kirimWA(ID_TUJUAN_NOTIFIKASI, header);
+    for (const p of perubahan) await kirimWA(ID_TUJUAN_NOTIFIKASI, p.teks);
+
+    // Kalau ada periode yang baru cair, kirim sekalian slip gaji terbarunya
+    if (perubahan.some((p) => p.tipe === "cair")) {
+        const slip = await getSlipGajiKaryawan(NAMA_SAYA_DI_ABSEN);
+        await kirimWA(ID_TUJUAN_NOTIFIKASI, `📄 *Slip gaji terbaru kamu:*`);
+        await kirimWA(ID_TUJUAN_NOTIFIKASI, slip);
+    }
+}
+
+const jalankanRondaGaji = async () => {
+    if (rondaGajiBerjalan) return;
+    rondaGajiBerjalan = true;
+    try {
+        const hasil = await ambilSheetPayrollAll();
+        if (hasil.error) return;
+        const snapshotBaru = buatSnapshotGaji(hasil.sheetAktif, hasil.rawData);
+        const jumlahBaru = Object.keys(snapshotBaru.karyawan).length;
+        if (jumlahBaru === 0) { console.log("⚠️ [Ronda Gaji] daftar karyawan tidak terbaca, ronda di-skip."); return; }
+        gagalRondaGajiBeruntun = 0;
+
+        const sekarang = Date.now();
+
+        // Pertama kali / ganti bulan: simpan baseline saja, JANGAN kirim notifikasi
+        if (!snapshotGajiDinotif || snapshotGajiDinotif.sheet !== snapshotBaru.sheet) {
+            snapshotGajiDinotif = snapshotBaru;
+            snapshotGajiTerakhir = snapshotBaru;
+            waktuGajiBerubahTerakhir = 0;
+            waktuGajiPendingMulai = 0;
+            await simpanSnapshotGaji();
+            console.log(`💼 [Ronda Gaji] baseline ${snapshotBaru.sheet} tersimpan (${jumlahBaru} karyawan).`);
+            return;
+        }
+
+        // Sanity check: jumlah karyawan anjlok drastis = data kebaca rusak, bukan beneran dihapus semua
+        if (snapshotGajiTerakhir) {
+            const jumlahLama = Object.keys(snapshotGajiTerakhir.karyawan).length;
+            if (jumlahLama >= 5 && jumlahBaru < jumlahLama * 0.5) {
+                console.log(`⚠️ [Ronda Gaji] jumlah karyawan anjlok (${jumlahLama} -> ${jumlahBaru}), ronda di-skip.`);
+                return;
+            }
+            if (JSON.stringify(snapshotBaru) !== JSON.stringify(snapshotGajiTerakhir)) waktuGajiBerubahTerakhir = sekarang;
+        }
+        snapshotGajiTerakhir = snapshotBaru;
+
+        const perubahan = bandingkanSnapshotGaji(snapshotGajiDinotif, snapshotBaru);
+        if (perubahan.length === 0) { waktuGajiPendingMulai = 0; return; }
+        if (!waktuGajiPendingMulai) waktuGajiPendingMulai = sekarang;
+
+        // Debounce: tunggu admin selesai ngetik (data tenang JEDA_TENANG_GAJI_MS), kecuali
+        // periode baru cair ("Done") yang dikirim langsung, atau sudah menunggu terlalu lama.
+        const adaCair = perubahan.some((p) => p.tipe === "cair");
+        const tenang = sekarang - waktuGajiBerubahTerakhir >= JEDA_TENANG_GAJI_MS;
+        const kelamaan = sekarang - waktuGajiPendingMulai >= BATAS_TUNGGU_GAJI_MS;
+        if (adaCair || tenang || kelamaan) {
+            snapshotGajiDinotif = snapshotBaru;      // tandai dulu supaya gak kirim dobel kalau pengiriman lambat
+            waktuGajiPendingMulai = 0;
+            await simpanSnapshotGaji();
+            await kirimNotifikasiGaji(perubahan);
+        }
+    } catch (err) {
+        gagalRondaGajiBeruntun++;
+        console.log(`❌ [Ronda Gaji] gagal (${gagalRondaGajiBeruntun}x berturut-turut): ${err.message}`);
+        if (gagalRondaGajiBeruntun === 6) sendSystemAlert(`❌ Ronda payroll gagal 6x berturut-turut: ${pesanErrorSheets(err)}`);
+    } finally {
+        rondaGajiBerjalan = false;
+    }
+};
+
+// Pengingat pencairan: dikirim pagi di tanggal HARI_PENGINGAT_PERIODE_1 (periode 1)
+// dan di hari terakhir bulan (periode 2), kecuali periodenya sudah ditandai Done di sheet.
+async function kirimPengingatGaji() {
+    const sekarang = new Date();
+    const hari = sekarang.getDate();
+    const akhirBulan = new Date(sekarang.getFullYear(), sekarang.getMonth() + 1, 0).getDate();
+    let kode = null;
+    if (hari === HARI_PENGINGAT_PERIODE_1) kode = "p1";
+    else if (hari === akhirBulan) kode = "p2";
+    if (!kode) return;
+
+    const hasil = await ambilSheetPayrollAll();
+    if (hasil.error) return;
+    const snap = buatSnapshotGaji(hasil.sheetAktif, hasil.rawData);
+    if (snap.status[kode]) return;
+
+    let total = 0, jumlah = 0;
+    for (const k of Object.values(snap.karyawan)) {
+        const t = kode === "p1" ? k.transfer1 : k.transfer2;
+        if (t > 0) { total += t; jumlah++; }
+    }
+    if (jumlah === 0) return;
+    const label = kode === "p1" ? "Tgl 1-15" : "Tgl 16-akhir bulan";
+    let msg = `⏰ *PENGINGAT PENCAIRAN GAJI*\nHari ini jadwal pencairan periode ${label} (${snap.sheet}).\n\n`;
+    msg += `💵 Total yang perlu ditransfer: *${formatRupiah(total)}*\n👥 Jumlah karyawan: ${jumlah}\n\n`;
+    msg += `_Ketik \`rekap payroll\` untuk rincian. Pengingat ini berhenti otomatis kalau sheet sudah ditandai Done._`;
+    await kirimWA(ID_TUJUAN_NOTIFIKASI, msg);
+}
+
+// Status gaji manual (`status gaji`): periode mana yang sudah ditandai cair + nominal
+async function getStatusGaji() {
+    try {
+        const hasil = await ambilSheetPayrollAll();
+        if (hasil.error) return hasil.error;
+        const snap = buatSnapshotGaji(hasil.sheetAktif, hasil.rawData);
+        if (Object.keys(snap.karyawan).length === 0) return `⚠️ Daftar karyawan tidak terbaca di sheet ${snap.sheet}.`;
+        const rp = formatRupiah;
+        const hitung = (kode) => {
+            let total = 0, jumlah = 0;
+            for (const k of Object.values(snap.karyawan)) {
+                const t = kode === "p1" ? k.transfer1 : k.transfer2;
+                if (t > 0) { total += t; jumlah++; }
+            }
+            return { total, jumlah };
+        };
+        const p1 = hitung("p1"), p2 = hitung("p2");
+        const saya = snap.karyawan[NAMA_SAYA_DI_ABSEN.toUpperCase()];
+
+        let msg = `━━━━━━━━━━━━━━━━━━━━\n📌 *STATUS GAJI: ${snap.sheet}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += `*Periode 1 (Tgl 1-15)*\n${snap.status.p1 ? `✅ Sudah ditransfer (${snap.status.p1})` : `⏳ Belum ditandai cair di sheet`}\n💵 ${rp(p1.total)} untuk ${p1.jumlah} karyawan\n\n`;
+        msg += `*Periode 2 (Tgl 16-akhir)*\n${snap.status.p2 ? `✅ Sudah ditransfer (${snap.status.p2})` : `⏳ Belum ditandai cair di sheet`}\n💵 ${rp(p2.total)} untuk ${p2.jumlah} karyawan\n`;
+        if (saya) msg += `\n👤 *Gaji kamu (${saya.nama}):*\n• Periode 1: ${rp(saya.transfer1)}\n• Periode 2: ${rp(saya.transfer2)}\n• Total: *${rp(saya.transfer1 + saya.transfer2)}*\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━`;
+        return msg;
+    } catch (error) {
+        return pesanErrorSheets(error);
     }
 }
 
@@ -1256,14 +1796,14 @@ const simulateTyping = async (chat, text) => {
 // Ditambah RETRY 2x dengan jeda singkat, buat nutup kasus gagal sesaat (network hiccup pas
 // momen kirim notif). Kalau tetap gagal setelah retry, return null (pemanggil akan tetap
 // nampilin baris "Diubah oleh" tapi dengan keterangan gagal, bukan disembunyikan diam-diam).
-async function getAdminTerakhirEdit(percobaanKe = 1) {
+async function getAdminTerakhirEdit(percobaanKe = 1, fileId = SPREADSHEET_ID) {
     try {
         const authClient = await authorize();
         if (!authClient) return null;
         const drive = google.drive({ version: "v3", auth: authClient });
 
         const res = await drive.files.get({
-            fileId: SPREADSHEET_ID,
+            fileId: fileId,
             fields: "modifiedTime, lastModifyingUser(displayName, emailAddress)",
             supportsAllDrives: true,
         });
@@ -1278,7 +1818,7 @@ async function getAdminTerakhirEdit(percobaanKe = 1) {
         console.log(`⚠️ Gagal ambil info admin terakhir edit (percobaan ${percobaanKe}/2):`, err.message);
         if (percobaanKe < 2) {
             await new Promise((res) => setTimeout(res, 2000));
-            return getAdminTerakhirEdit(percobaanKe + 1);
+            return getAdminTerakhirEdit(percobaanKe + 1, fileId);
         }
         return null;
     }
@@ -1318,6 +1858,8 @@ async function kirimNotifikasiRevisi() {
 }
 
 const jalankanRonda = async () => {
+    if (rondaJadwalBerjalan) return; // ronda sebelumnya belum selesai (download Excel lambat), jangan numpuk
+    rondaJadwalBerjalan = true;
     console.log("🕵️ Meronda 2 Bulan Sekaligus...");
     try {
         const dataTerbaru = await getJadwalMultiBulan();
@@ -1358,6 +1900,8 @@ const jalankanRonda = async () => {
     } catch (err) {
         console.log(`❌ Sistem Ronda Gagal (objekDataLama TIDAK ditimpa): ${err.message}`);
         sendSystemAlert(`❌ Sistem Ronda Gagal: ${err.message}`);
+    } finally {
+        rondaJadwalBerjalan = false;
     }
 };
 
@@ -1648,26 +2192,47 @@ client.on("ready", async () => {
     } catch (err) {
         console.log("⚠️ Gagal ambil jadwal awal saat startup, akan dicoba lagi di ronda berikutnya:", err.message);
     }
-    setInterval(jalankanRonda, WAKTU_RONDA_MS);
 
-    cron.schedule('0 6 * * *', async () => {
-        try {
-            const dateObj = new Date();
-            const tglHariIni = dateObj.getDate().toString();
-            const freshData = await getJadwalMultiBulan();
-            objekDataLama = freshData;
+    // Event "ready" bisa kepanggil LAGI setelah reconnect otomatis. Tanpa guard ini, setiap reconnect
+    // menambah setInterval & cron baru -> notifikasi jadi dobel/triple. Daftarkan penjadwal cuma SEKALI.
+    if (!penjadwalSudahAktif) {
+        penjadwalSudahAktif = true;
 
-            const daftarPesan = prosesDataKePesanWA(objekDataLama, tglHariIni, "");
-            let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
-            await kirimWA(ID_TUJUAN_NOTIFIKASI, sapaanPagi);
+        setInterval(jalankanRonda, WAKTU_RONDA_MS);
 
-            for (const pesan of daftarPesan) {
-                await kirimWA(ID_TUJUAN_NOTIFIKASI, pesan);
+        // Ronda payroll: muat baseline dari disk, jalankan sekali (baseline/diff), lalu tiap 5 menit
+        await muatSnapshotGaji();
+        jalankanRondaGaji();
+        setInterval(jalankanRondaGaji, WAKTU_RONDA_GAJI_MS);
+
+        cron.schedule('0 6 * * *', async () => {
+            try {
+                const dateObj = new Date();
+                const tglHariIni = dateObj.getDate().toString();
+                const freshData = await getJadwalMultiBulan();
+                objekDataLama = freshData;
+
+                const daftarPesan = prosesDataKePesanWA(objekDataLama, tglHariIni, "");
+                let sapaanPagi = `🌅 *MORNING BRIEFING*\nSelamat pagi! Hari ini ada *${daftarPesan.length} Event* yang tercatat di sistem.`;
+                await kirimWA(ID_TUJUAN_NOTIFIKASI, sapaanPagi);
+
+                for (const pesan of daftarPesan) {
+                    await kirimWA(ID_TUJUAN_NOTIFIKASI, pesan);
+                }
+            } catch (error) {
+                sendSystemAlert(`❌ Gagal mengirim Morning Briefing: ${error.message}`);
             }
-        } catch (error) {
-            sendSystemAlert(`❌ Gagal mengirim Morning Briefing: ${error.message}`);
-        }
-    }, { scheduled: true, timezone: "Asia/Makassar" });
+        }, { scheduled: true, timezone: "Asia/Makassar" });
+
+        // Pengingat pencairan gaji, jam 09:00 WITA (hanya terkirim di tanggal pengingat & akhir bulan)
+        cron.schedule('0 9 * * *', async () => {
+            try {
+                await kirimPengingatGaji();
+            } catch (error) {
+                console.log("⚠️ Gagal kirim pengingat gaji:", error.message);
+            }
+        }, { scheduled: true, timezone: "Asia/Makassar" });
+    }
 
     sendSystemAlert("✅ AGS Bot Enterprise System Online!");
 });
@@ -1708,32 +2273,91 @@ process.on("unhandledRejection", (error) => {
 client.on("message", async (msg) => {
     const ALLOWED_ADMINS = ["628970282769", "35270472773718"];
     const contact = await msg.getContact();
-    const nomorPengirim = contact.number;
+    const nomorPengirim = contact.number; 
 
     if (!nomorPengirim || !ALLOWED_ADMINS.includes(nomorPengirim)) return;
 
     const text = msg.body.toLowerCase().trim();
-
+    
     let chat = null;
     try { chat = await msg.getChat(); } catch (error) {}
 
     const balasPesan = async (teksBalasan) => {
         if (chat) await simulateTyping(chat, teksBalasan);
-        try { await msg.reply(teksBalasan); }
+        try { await msg.reply(teksBalasan); } 
         catch (err) { await client.sendMessage(ID_TUJUAN_NOTIFIKASI, teksBalasan); }
     };
 
     if (["halo", "menu", "jadwal", "bot"].includes(text)) {
-        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Mendatang\n\n💰 *Keuangan & Slip Gaji (Pribadi):*\n• \`gaji\` (Bulan Berjalan)\n• \`gaji [bulan]\` (Contoh: \`gaji mei\`)\n• \`rekap tahun\` (Ringkasan Tahunan)\n• \`top venue\` (Peringkat Klien Terbesar)\n• \`proyeksi tabungan\` (Estimasi Saldo)\n\n🏢 *Payroll Seluruh Karyawan (Admin):*\n• \`gaji karyawan [nama]\` (Slip gaji siapa aja)\n• \`rekap payroll\` (Total cash-out bulan ini + per tim)\n• \`kasbon aktif\` (Daftar yang masih punya kasbon)\n• \`leaderboard gaji\` (Top fee & job terbanyak)\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n\n👥 *Cek Personal Jadwal:*\n• \`crew [nama]\` (Semua job crew tsb)\n• \`alat [nama]\` (Semua event yang pakai alat tsb)\n• \`cek konflik\` (Cek crew bentrok jadwal)\n\n✏️ Ketik pilihan Anda...`;
+        const balasanMenu = `━━━━━━━━━━━━━━━━━━\n🤖 *AGS ENTERPRISE BOT*\n━━━━━━━━━━━━━━━━━━\n\n1️⃣ 📍 Jadwal Hari Ini\n2️⃣ 📍 Jadwal Besok\n3️⃣ 📆 Semua Jadwal Mendatang\n\n💰 *Gaji Pribadi:*\n• \`gaji\` (Bulan Berjalan)\n• \`gaji [bulan]\` (Contoh: \`gaji mei\`)\n• \`rekap tahun\` (Ringkasan Tahunan)\n• \`top venue\` (Klien Terbesar)\n• \`proyeksi tabungan\` (Estimasi Saldo)\n\n🏢 *Payroll Seluruh Karyawan:*\n• \`gaji karyawan [nama]\` (Slip siapa aja, + bulan opsional)\n• \`daftar karyawan\` (Daftar nama & tim)\n• \`status gaji\` (Periode mana yang sudah cair)\n• \`rekap payroll\` (Total cash-out + per periode)\n• \`kasbon aktif\` (Daftar kasbon)\n• \`leaderboard gaji\` (Top 10 fee & job)\n• \`bandingkan gaji [nama]\` (Bulan ini vs lalu)\n• \`tabungan [nama]\` / \`tabungan semua\`\n\n🔍 *Pencarian Cerdas:*\nKetik \`cari [kata kunci]\`\n\n👥 *Cek Jadwal:*\n• \`crew [nama]\` (Semua job crew tsb)\n• \`alat [nama]\` (Semua event yang pakai alat tsb)\n• \`cek konflik\` (Crew bentrok jadwal)\n\n🔔 _Bot otomatis mengabari kalau jadwal/payroll berubah & saat gaji cair._\n\n✏️ Ketik pilihan Anda...`;
         await balasPesan(balasanMenu);
-    }
-
+    } 
+    
     else if (text === "gaji" || text === "slip gaji") {
         await balasPesan(`⏳ Mengakses brankas data slip gaji bulan ini...`);
-        const hasilGaji = await parserEngineSlipGaji(NAMA_SAYA_DI_ABSEN, null);
+        const hasilGaji = await parserEngineSlipGaji(NAMA_SAYA_DI_ABSEN, null); 
         await balasPesan(hasilGaji);
     }
 
+    // ---- PAYROLL SELURUH KARYAWAN ----
+    // PENTING: blok ini HARUS di atas branch `gaji [bulan]` (pribadi). Kalau di bawahnya,
+    // "gaji karyawan budi" ketangkap duluan sebagai arsip bulan "karyawan budi".
+    else if (text.startsWith("gaji karyawan")) {
+        const sisaTeks = text.replace("gaji karyawan", "").trim();
+        if (!sisaTeks) return balasPesan("⚠️ Format: `gaji karyawan [nama]` atau `gaji karyawan [nama] [bulan]`.\nKetik `daftar karyawan` untuk lihat nama yang terdaftar.");
+
+        const kata = sisaTeks.split(/\s+/);
+        let bulanQuery = null;
+        if (kata.length > 1 && NAMA_BULAN_LOWER.includes(kata[kata.length - 1])) bulanQuery = kata.pop();
+        const namaKaryawan = kata.join(" ").trim();
+        if (namaKaryawan.length < 2) return balasPesan("⚠️ Nama karyawan terlalu pendek (minimal 2 huruf).");
+
+        await balasPesan(`⏳ Mengakses slip gaji *${namaKaryawan.toUpperCase()}*${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : ""}...`);
+        await balasPesan(await getSlipGajiKaryawan(namaKaryawan, bulanQuery));
+    }
+
+    else if (text === "daftar karyawan" || text.startsWith("daftar karyawan ")) {
+        const bulanQuery = text.replace("daftar karyawan", "").trim() || null;
+        await balasPesan(await getDaftarKaryawan(bulanQuery));
+    }
+
+    else if (text.startsWith("bandingkan gaji")) {
+        const nama = text.replace("bandingkan gaji", "").trim() || NAMA_SAYA_DI_ABSEN;
+        await balasPesan(`⏳ Membandingkan gaji *${nama.toUpperCase()}* bulan ini vs bulan lalu...`);
+        await balasPesan(await getPerbandinganGaji(nama));
+    }
+
+    else if (text === "tabungan" || text.startsWith("tabungan ")) {
+        const sisa = text.replace("tabungan", "").trim();
+        await balasPesan(`⏳ Membuka data tabungan...`);
+        if (sisa === "semua") await balasPesan(await getTabunganKaryawan(null));
+        else await balasPesan(await getTabunganKaryawan(sisa || NAMA_SAYA_DI_ABSEN));
+    }
+
+    else if (text === "status gaji" || text === "cek gaji masuk") {
+        await balasPesan(`⏳ Mengecek status pencairan gaji...`);
+        await balasPesan(await getStatusGaji());
+    }
+
+    else if (text === "rekap payroll" || text.startsWith("rekap payroll ")) {
+        const bulanQuery = text.replace("rekap payroll", "").trim() || null;
+        await balasPesan(`⏳ Menghitung rekap payroll seluruh karyawan${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
+        await balasPesan(await getRekapPayrollBulanIni(bulanQuery));
+    }
+
+    else if (text === "kasbon aktif" || text === "cek kasbon" || text.startsWith("kasbon aktif ")) {
+        const bulanQuery = text.replace("kasbon aktif", "").replace("cek kasbon", "").trim() || null;
+        await balasPesan(`⏳ Mengecek daftar kasbon aktif${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
+        await balasPesan(await getDaftarKasbonAktif(bulanQuery));
+    }
+
+    else if (text === "leaderboard gaji" || text === "leaderboard payroll" || text.startsWith("leaderboard gaji ") || text.startsWith("leaderboard payroll ")) {
+        const bulanQuery = text.replace("leaderboard gaji", "").replace("leaderboard payroll", "").trim() || null;
+        await balasPesan(`⏳ Menyusun leaderboard top 10${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
+        await balasPesan(await getLeaderboardPayroll(bulanQuery));
+    }
+
+    // ---- GAJI PRIBADI (spreadsheet lama) ----
     else if (text.startsWith("gaji ")) {
         let bulanQuery = text.replace("gaji ", "").trim();
         await balasPesan(`⏳ Membuka arsip slip gaji bulan *${bulanQuery.toUpperCase()}*...`);
@@ -1757,46 +2381,6 @@ client.on("message", async (msg) => {
         await balasPesan(`⏳ Menghitung proyeksi saldo tabungan akhir tahun...`);
         const hasilProyeksi = await getProyeksiTabungan(NAMA_SAYA_DI_ABSEN);
         await balasPesan(hasilProyeksi);
-    }
-
-    else if (text.startsWith("gaji karyawan ")) {
-        let sisaTeks = text.replace("gaji karyawan ", "").trim();
-        // Cek apakah kata terakhir adalah nama bulan (misal "gaji karyawan budi agustus")
-        let kataKataTeks = sisaTeks.split(" ");
-        let kataTerakhir = kataKataTeks[kataKataTeks.length - 1];
-        let bulanQuery = null;
-        if (kataKataTeks.length > 1 && NAMA_BULAN_LOWER.includes(kataTerakhir)) {
-            bulanQuery = kataTerakhir;
-            kataKataTeks.pop();
-        }
-        const namaKaryawan = kataKataTeks.join(" ").trim();
-
-        if (namaKaryawan.length < 2) return balasPesan("⚠️ Nama karyawan terlalu pendek. Format: `gaji karyawan [nama]`");
-
-        await balasPesan(`⏳ Mengakses slip gaji *${namaKaryawan.toUpperCase()}*${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : ""}...`);
-        const hasil = await getSlipGajiKaryawan(namaKaryawan, bulanQuery);
-        await balasPesan(hasil);
-    }
-
-    else if (text === "rekap payroll" || text.startsWith("rekap payroll ")) {
-        let bulanQuery = text.replace("rekap payroll", "").trim() || null;
-        await balasPesan(`⏳ Menghitung rekap payroll seluruh karyawan${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
-        const hasil = await getRekapPayrollBulanIni(bulanQuery);
-        await balasPesan(hasil);
-    }
-
-    else if (text === "kasbon aktif" || text === "cek kasbon" || text.startsWith("kasbon aktif ")) {
-        let bulanQuery = text.replace("kasbon aktif", "").replace("cek kasbon", "").trim() || null;
-        await balasPesan(`⏳ Mengecek daftar kasbon aktif${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
-        const hasil = await getDaftarKasbonAktif(bulanQuery);
-        await balasPesan(hasil);
-    }
-
-    else if (text === "leaderboard gaji" || text === "leaderboard payroll" || text.startsWith("leaderboard gaji ") || text.startsWith("leaderboard payroll ")) {
-        let bulanQuery = text.replace("leaderboard gaji", "").replace("leaderboard payroll", "").trim() || null;
-        await balasPesan(`⏳ Menyusun leaderboard payroll${bulanQuery ? ` (${bulanQuery.toUpperCase()})` : " bulan ini"}...`);
-        const hasil = await getLeaderboardPayroll(bulanQuery);
-        await balasPesan(hasil);
     }
 
     else if (text === "cek konflik" || text === "konflik jadwal") {
@@ -1869,7 +2453,7 @@ client.on("message", async (msg) => {
             infoWaktu = "Hari Ini";
         } else if (keyword.endsWith(" besok")) {
             keyword = keyword.replace(" besok", "").trim();
-            let besok = new Date();
+            let besok = new Date(); 
             besok.setDate(besok.getDate() + 1);
             targetTanggal = besok.getDate().toString();
             infoWaktu = "Besok";
@@ -1886,7 +2470,7 @@ client.on("message", async (msg) => {
             await balasPesan(`✅ Ditemukan *${daftarPesan.length} Hasil* pencarian:`);
             for (const pesan of daftarPesan) {
                 await balasPesan(pesan);
-                await new Promise((res) => setTimeout(res, 500));
+                await new Promise((res) => setTimeout(res, 500)); 
             }
         }
     }
@@ -1911,16 +2495,16 @@ client.on("message", async (msg) => {
         await balasPesan(`⚡ Menarik data ${labelTarget} (Cache Mode)...`);
 
         const dataUntukPerintah = await ambilDataJadwal();
-        const keywordVirtual = text === "3" ? "[SHOW_ALL]" : "";
+        const keywordVirtual = text === "3" ? "[SHOW_ALL]" : ""; 
         const daftarPesan = prosesDataKePesanWA(dataUntukPerintah, tglTarget, keywordVirtual);
 
         if (daftarPesan.length === 0) {
             await balasPesan(`ℹ️ Tidak ada jadwal untuk ${labelTarget}.`);
         } else {
             for (const pesan of daftarPesan) {
-                const pesanBersih = pesan.replace("[SHOW_ALL]", "").trim();
+                const pesanBersih = pesan.replace("[SHOW_ALL]", "").trim(); 
                 await balasPesan(pesanBersih);
-                await new Promise((res) => setTimeout(res, 500));
+                await new Promise((res) => setTimeout(res, 500)); 
             }
         }
     }
